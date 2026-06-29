@@ -1,0 +1,53 @@
+"""Reusable Slurm-backed shared worker pool orchestration."""
+
+from __future__ import annotations
+
+from shared_worker_pool.pool import (
+    POOL_LAUNCHER_VERSION,
+    POOL_WORKER_VERSION,
+    AppNeed,
+    PoolAppProfile,
+    PoolConfig,
+    PoolScaleState,
+    app_need_from_payload,
+    app_need_from_status,
+    app_need_to_payload,
+    candidate_apps,
+    candidate_apps_from_needs,
+    desired_pool_submissions,
+    dispatch_required_worker_version,
+    dispatch_state_has_activity,
+    dispatch_state_payload,
+    load_pool_config,
+    pool_worker_should_retire,
+    read_dispatch_state_needs,
+    read_dispatch_state_payload,
+    run_launcher_loop,
+    run_pool_worker,
+    write_dispatch_state,
+)
+
+__all__ = [
+    "POOL_LAUNCHER_VERSION",
+    "POOL_WORKER_VERSION",
+    "AppNeed",
+    "PoolAppProfile",
+    "PoolConfig",
+    "PoolScaleState",
+    "app_need_from_payload",
+    "app_need_from_status",
+    "app_need_to_payload",
+    "candidate_apps",
+    "candidate_apps_from_needs",
+    "desired_pool_submissions",
+    "dispatch_required_worker_version",
+    "dispatch_state_has_activity",
+    "dispatch_state_payload",
+    "load_pool_config",
+    "pool_worker_should_retire",
+    "read_dispatch_state_needs",
+    "read_dispatch_state_payload",
+    "run_launcher_loop",
+    "run_pool_worker",
+    "write_dispatch_state",
+]
