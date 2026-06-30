@@ -16,6 +16,8 @@ from shared_worker_pool import (
     candidate_apps,
     desired_pool_submissions,
     dispatch_required_worker_version,
+    host_load_cpu_basis,
+    host_load_is_high,
     pool_worker_should_retire,
     write_dispatch_state,
 )
@@ -53,6 +55,44 @@ def _config(root: Path, apps: tuple[PoolAppProfile, ...]) -> PoolConfig:
 
 
 class SharedWorkerPoolTests(unittest.TestCase):
+    def test_host_load_threshold_uses_visible_host_cpus(self) -> None:
+        self.assertEqual(host_load_cpu_basis(allocated_cpus=2, visible_cpus=32), 32)
+        self.assertFalse(
+            host_load_is_high(
+                24.0,
+                allocated_cpus=2,
+                visible_cpus=32,
+                max_load_per_cpu=3.0,
+            )
+        )
+        self.assertTrue(
+            host_load_is_high(
+                97.0,
+                allocated_cpus=2,
+                visible_cpus=32,
+                max_load_per_cpu=3.0,
+            )
+        )
+
+    def test_host_load_threshold_never_shrinks_below_allocation(self) -> None:
+        self.assertEqual(host_load_cpu_basis(allocated_cpus=64, visible_cpus=32), 64)
+        self.assertFalse(
+            host_load_is_high(
+                95.0,
+                allocated_cpus=64,
+                visible_cpus=32,
+                max_load_per_cpu=1.5,
+            )
+        )
+        self.assertTrue(
+            host_load_is_high(
+                96.0,
+                allocated_cpus=64,
+                visible_cpus=32,
+                max_load_per_cpu=1.5,
+            )
+        )
+
     def test_sums_app_needs_with_capacity(self) -> None:
         needs = [
             AppNeed(name="caida", queued_units=4, running_units=1, worker_capacity=1),

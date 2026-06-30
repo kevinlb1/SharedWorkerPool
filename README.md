@@ -14,6 +14,13 @@ SharedWorkerPool owns the generic mechanics:
 - node-local scratch and non-credential cache setup;
 - delegation from a generic pool worker into app-specific worker modules.
 
+The runtime helpers also include `host_load_cpu_basis()` and
+`host_load_is_high()` for dense app workers that perform their own load
+admission. These helpers compare host-wide load averages against
+`max(allocated_cpus, visible_cpus)`, not just a small Slurm CPU allocation, so a
+healthy 32-core node is not treated as overloaded merely because a shared worker
+requested 2 CPUs.
+
 Apps that use this package keep their own control-plane and job semantics. A
 configured app must provide:
 
@@ -55,4 +62,3 @@ Use `scripts/submit_shared_slurm_workers.sh` from this repository or copy it
 into an app deployment checkout. The script submits generic workers that run
 `python -m shared_worker_pool worker`; app-specific work happens only after a
 generic worker delegates to an app's configured worker module.
-

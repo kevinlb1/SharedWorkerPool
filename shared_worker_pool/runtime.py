@@ -207,6 +207,35 @@ def live_slurm_job_count(job_name: str, user: str | None = None) -> int:
     return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
+def host_load_cpu_basis(*, allocated_cpus: int, visible_cpus: int | None = None) -> int:
+    """Return the CPU count that host load thresholds should be measured against.
+
+    Slurm workers often request a small CPU allocation on a much larger shared
+    host. The system load average is host-wide, so comparing it only to the
+    requested allocation can make healthy nodes look overloaded.
+    """
+    allocated = max(1, int(allocated_cpus or 1))
+    if visible_cpus is None:
+        visible_cpus = os.cpu_count()
+    visible = max(1, int(visible_cpus or allocated))
+    return max(allocated, visible)
+
+
+def host_load_is_high(
+    load_1m: float | None,
+    *,
+    allocated_cpus: int,
+    max_load_per_cpu: float,
+    visible_cpus: int | None = None,
+) -> bool:
+    if load_1m is None or max_load_per_cpu <= 0:
+        return False
+    return float(load_1m) >= float(max_load_per_cpu) * host_load_cpu_basis(
+        allocated_cpus=allocated_cpus,
+        visible_cpus=visible_cpus,
+    )
+
+
 def free_disk_bytes(path: Path) -> int:
     path.mkdir(parents=True, exist_ok=True)
     return int(shutil.disk_usage(path).free)

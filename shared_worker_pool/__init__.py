@@ -26,6 +26,7 @@ from shared_worker_pool.pool import (
     run_pool_worker,
     write_dispatch_state,
 )
+from shared_worker_pool.runtime import host_load_cpu_basis, host_load_is_high
 
 __all__ = [
     "POOL_LAUNCHER_VERSION",
@@ -43,6 +44,8 @@ __all__ = [
     "dispatch_required_worker_version",
     "dispatch_state_has_activity",
     "dispatch_state_payload",
+    "host_load_cpu_basis",
+    "host_load_is_high",
     "load_pool_config",
     "pool_worker_should_retire",
     "read_dispatch_state_needs",
