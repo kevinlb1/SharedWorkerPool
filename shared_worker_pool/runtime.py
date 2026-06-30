@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,10 @@ class LauncherRequestError(ControlPlaneRequestError):
 
 class WorkerRequestError(ControlPlaneRequestError):
     pass
+
+
+PROCESS_CLOCK_TICKS = os.sysconf(os.sysconf_names.get("SC_CLK_TCK", "SC_CLK_TCK"))
+PAGE_SIZE_BYTES = os.sysconf("SC_PAGE_SIZE")
 
 
 def timestamped_log(message: str) -> None:
@@ -207,6 +212,122 @@ def live_slurm_job_count(job_name: str, user: str | None = None) -> int:
     return len([line for line in result.stdout.splitlines() if line.strip()])
 
 
+def env_int(name: str) -> int:
+    try:
+        return int(str(os.environ.get(name) or "").strip() or "0")
+    except ValueError:
+        return 0
+
+
+def meminfo_bytes() -> dict[str, int]:
+    path = Path("/proc/meminfo")
+    if not path.exists():
+        return {}
+    values: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            key, _, raw_value = line.partition(":")
+            parts = raw_value.strip().split()
+            if not key or not parts:
+                continue
+            try:
+                kib = int(parts[0])
+            except ValueError:
+                continue
+            values[key] = kib * 1024
+    except OSError:
+        return {}
+    return values
+
+
+def effective_allocated_cpus(explicit_allocated_cpus: int | None = None) -> int:
+    explicit = max(0, int(explicit_allocated_cpus or 0))
+    if explicit:
+        return explicit
+    for name in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        value = env_int(name)
+        if value > 0:
+            return value
+    return max(1, int(os.cpu_count() or 1))
+
+
+def effective_allocated_memory_mb(
+    explicit_allocated_memory_mb: int | None = None,
+    *,
+    allocated_cpus: int | None = None,
+) -> int:
+    explicit = max(0, int(explicit_allocated_memory_mb or 0))
+    if explicit:
+        return explicit
+    mem_per_node = env_int("SLURM_MEM_PER_NODE")
+    if mem_per_node > 0:
+        return mem_per_node
+    mem_per_cpu = env_int("SLURM_MEM_PER_CPU")
+    if mem_per_cpu > 0:
+        return mem_per_cpu * max(1, int(allocated_cpus or effective_allocated_cpus()))
+    return 0
+
+
+def current_load_average() -> tuple[float, float, float] | None:
+    try:
+        return os.getloadavg()
+    except (AttributeError, OSError):
+        return None
+
+
+def proc_snapshot() -> dict[int, tuple[int, int, int]]:
+    snapshot: dict[int, tuple[int, int, int]] = {}
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return snapshot
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="ignore")
+            close_paren = stat_text.rfind(")")
+            if close_paren < 0:
+                continue
+            fields = stat_text[close_paren + 2 :].split()
+            ppid = int(fields[1])
+            cpu_ticks = int(fields[11]) + int(fields[12])
+            statm_fields = (entry / "statm").read_text(encoding="utf-8", errors="ignore").split()
+            rss_bytes = int(statm_fields[1]) * PAGE_SIZE_BYTES if len(statm_fields) > 1 else 0
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError, OSError):
+            continue
+        snapshot[pid] = (ppid, rss_bytes, cpu_ticks)
+    return snapshot
+
+
+def process_forest_resources(root_pids: list[int]) -> dict[str, int]:
+    roots = {pid for pid in root_pids if pid > 0}
+    snapshot = proc_snapshot()
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _rss, _cpu_ticks) in snapshot.items():
+        children.setdefault(ppid, []).append(pid)
+    seen: set[int] = set()
+    stack = list(roots)
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, []))
+    rss_bytes = 0
+    cpu_ticks = 0
+    process_count = 0
+    for pid in seen:
+        item = snapshot.get(pid)
+        if item is None:
+            continue
+        _ppid, rss, ticks = item
+        rss_bytes += rss
+        cpu_ticks += ticks
+        process_count += 1
+    return {"rssBytes": rss_bytes, "cpuTicks": cpu_ticks, "processCount": process_count}
+
+
 def host_load_cpu_basis(*, allocated_cpus: int, visible_cpus: int | None = None) -> int:
     """Return the CPU count that host load thresholds should be measured against.
 
@@ -233,6 +354,121 @@ def host_load_is_high(
     return float(load_1m) >= float(max_load_per_cpu) * host_load_cpu_basis(
         allocated_cpus=allocated_cpus,
         visible_cpus=visible_cpus,
+    )
+
+
+@dataclass(frozen=True)
+class ResourceAdmission:
+    allowed: bool
+    reason: str
+    advertised_capacity: int
+    metrics: dict[str, Any]
+
+
+def resource_admission(
+    *,
+    scratch_root: Path,
+    configured_capacity: int,
+    active_work: int,
+    allocated_cpus: int | None = None,
+    allocated_memory_mb: int | None = None,
+    max_load_per_cpu: float = 0.0,
+    min_free_memory_mb: float = 0.0,
+    memory_reserve_per_work_mb: float = 0.0,
+    min_free_disk_mb: float = 0.0,
+    root_pids: list[int] | None = None,
+    work_label: str = "job",
+) -> ResourceAdmission:
+    configured_capacity = max(1, int(configured_capacity or 1))
+    active_work = max(0, int(active_work or 0))
+    allocated_cpus = effective_allocated_cpus(allocated_cpus)
+    visible_cpus = max(1, int(os.cpu_count() or allocated_cpus or 1))
+    cpu_basis = host_load_cpu_basis(allocated_cpus=allocated_cpus, visible_cpus=visible_cpus)
+    allocated_memory_mb = effective_allocated_memory_mb(
+        allocated_memory_mb,
+        allocated_cpus=allocated_cpus,
+    )
+    free_disk = free_disk_bytes(scratch_root)
+    free_disk_mb = free_disk / (1024 * 1024)
+    meminfo = meminfo_bytes()
+    available_memory_bytes = meminfo.get("MemAvailable", 0)
+    available_memory_mb = available_memory_bytes / (1024 * 1024) if available_memory_bytes else 0.0
+    worker_resources = process_forest_resources(root_pids or [os.getpid()])
+    worker_rss_mb = worker_resources["rssBytes"] / (1024 * 1024)
+    allocation_free_memory_mb = (
+        max(0.0, float(allocated_memory_mb) - worker_rss_mb) if allocated_memory_mb > 0 else None
+    )
+    load_average = current_load_average()
+    load_1m = float(load_average[0]) if load_average is not None else None
+    max_load_per_cpu = max(0.0, float(max_load_per_cpu or 0.0))
+    min_free_memory_mb = max(0.0, float(min_free_memory_mb or 0.0))
+    memory_reserve_per_work_mb = max(0.0, float(memory_reserve_per_work_mb or 0.0))
+    min_free_disk_mb = max(0.0, float(min_free_disk_mb or 0.0))
+    required_memory_headroom_mb = min_free_memory_mb + memory_reserve_per_work_mb
+
+    metrics: dict[str, Any] = {
+        "configuredCapacity": configured_capacity,
+        "activeWork": active_work,
+        "activeTurns": active_work,
+        "allocatedCpus": allocated_cpus,
+        "visibleCpus": visible_cpus,
+        "hostLoadCpuBasis": cpu_basis,
+        "allocatedMemoryMb": allocated_memory_mb,
+        "freeDiskMb": free_disk_mb,
+        "availableMemoryMb": available_memory_mb,
+        "workerRssMb": worker_rss_mb,
+        "workerProcessCount": worker_resources["processCount"],
+        "allocationFreeMemoryMb": allocation_free_memory_mb,
+        "load1m": load_1m,
+        "maxLoadPerCpu": max_load_per_cpu,
+        "minFreeMemoryMb": min_free_memory_mb,
+        "memoryReservePerWorkMb": memory_reserve_per_work_mb,
+        "memoryReservePerTurnMb": memory_reserve_per_work_mb,
+        "minFreeDiskMb": min_free_disk_mb,
+    }
+
+    if active_work >= configured_capacity:
+        return ResourceAdmission(
+            allowed=False,
+            reason=f"worker is at configured {work_label} capacity",
+            advertised_capacity=configured_capacity,
+            metrics=metrics,
+        )
+
+    reason = ""
+    if min_free_disk_mb and free_disk_mb < min_free_disk_mb:
+        reason = f"scratch disk headroom is low ({free_disk_mb:.0f} MiB free)"
+    elif required_memory_headroom_mb and available_memory_mb and available_memory_mb < required_memory_headroom_mb:
+        reason = f"system memory headroom is low ({available_memory_mb:.0f} MiB available)"
+    elif (
+        required_memory_headroom_mb
+        and allocation_free_memory_mb is not None
+        and allocation_free_memory_mb < required_memory_headroom_mb
+    ):
+        reason = f"worker allocation memory headroom is low ({allocation_free_memory_mb:.0f} MiB remaining)"
+    elif host_load_is_high(
+        load_1m,
+        allocated_cpus=allocated_cpus,
+        visible_cpus=visible_cpus,
+        max_load_per_cpu=max_load_per_cpu,
+    ):
+        reason = (
+            f"host load is high ({load_1m:.2f} over {cpu_basis} visible CPU(s); "
+            f"allocation has {allocated_cpus} CPU(s))"
+        )
+
+    if reason:
+        return ResourceAdmission(
+            allowed=False,
+            reason=reason,
+            advertised_capacity=active_work,
+            metrics=metrics,
+        )
+    return ResourceAdmission(
+        allowed=True,
+        reason="resource headroom is available",
+        advertised_capacity=configured_capacity,
+        metrics=metrics,
     )
 
 

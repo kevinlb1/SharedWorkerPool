@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from shared_worker_pool import runtime as runtime_module
 from shared_worker_pool import (
     POOL_WORKER_VERSION,
     AppNeed,
@@ -19,6 +20,7 @@ from shared_worker_pool import (
     host_load_cpu_basis,
     host_load_is_high,
     pool_worker_should_retire,
+    resource_admission,
     write_dispatch_state,
 )
 
@@ -92,6 +94,78 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 max_load_per_cpu=1.5,
             )
         )
+
+    def test_resource_admission_preserves_capacity_when_full(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(runtime_module, "free_disk_bytes", return_value=100 * 1024 * 1024 * 1024), \
+                patch.object(runtime_module, "meminfo_bytes", return_value={"MemAvailable": 96 * 1024 * 1024 * 1024}), \
+                patch.object(runtime_module, "process_forest_resources", return_value={"rssBytes": 1024, "cpuTicks": 0, "processCount": 1}), \
+                patch.object(runtime_module, "current_load_average", return_value=(1.0, 1.0, 1.0)):
+                admission = resource_admission(
+                    scratch_root=root,
+                    configured_capacity=2,
+                    active_work=2,
+                    allocated_cpus=16,
+                    allocated_memory_mb=48000,
+                    max_load_per_cpu=3.0,
+                    min_free_memory_mb=4096.0,
+                    memory_reserve_per_work_mb=1024.0,
+                    min_free_disk_mb=0.0,
+                    work_label="turn",
+                )
+
+            self.assertFalse(admission.allowed)
+            self.assertEqual(admission.advertised_capacity, 2)
+            self.assertIn("configured turn capacity", admission.reason)
+
+    def test_resource_admission_can_advertise_zero_capacity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(runtime_module, "free_disk_bytes", return_value=100 * 1024 * 1024 * 1024), \
+                patch.object(runtime_module, "meminfo_bytes", return_value={"MemAvailable": 128 * 1024 * 1024}), \
+                patch.object(runtime_module, "process_forest_resources", return_value={"rssBytes": 0, "cpuTicks": 0, "processCount": 1}), \
+                patch.object(runtime_module, "current_load_average", return_value=(0.0, 0.0, 0.0)):
+                admission = resource_admission(
+                    scratch_root=root,
+                    configured_capacity=8,
+                    active_work=0,
+                    allocated_cpus=16,
+                    allocated_memory_mb=48000,
+                    max_load_per_cpu=0.0,
+                    min_free_memory_mb=4096.0,
+                    memory_reserve_per_work_mb=1024.0,
+                    min_free_disk_mb=0.0,
+                )
+
+            self.assertFalse(admission.allowed)
+            self.assertEqual(admission.advertised_capacity, 0)
+            self.assertIn("memory headroom", admission.reason)
+
+    def test_resource_admission_uses_visible_host_cpus_for_load(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(runtime_module, "free_disk_bytes", return_value=100 * 1024 * 1024 * 1024), \
+                patch.object(runtime_module, "meminfo_bytes", return_value={"MemAvailable": 96 * 1024 * 1024 * 1024}), \
+                patch.object(runtime_module, "process_forest_resources", return_value={"rssBytes": 0, "cpuTicks": 0, "processCount": 1}), \
+                patch.object(runtime_module, "current_load_average", return_value=(24.0, 24.0, 24.0)), \
+                patch.object(runtime_module.os, "cpu_count", return_value=32):
+                admission = resource_admission(
+                    scratch_root=root,
+                    configured_capacity=4,
+                    active_work=0,
+                    allocated_cpus=2,
+                    allocated_memory_mb=6000,
+                    max_load_per_cpu=3.0,
+                    min_free_memory_mb=4096.0,
+                    memory_reserve_per_work_mb=1024.0,
+                    min_free_disk_mb=0.0,
+                )
+
+            self.assertTrue(admission.allowed)
+            self.assertEqual(admission.metrics["allocatedCpus"], 2)
+            self.assertEqual(admission.metrics["visibleCpus"], 32)
+            self.assertEqual(admission.metrics["hostLoadCpuBasis"], 32)
 
     def test_sums_app_needs_with_capacity(self) -> None:
         needs = [

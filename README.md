@@ -14,12 +14,15 @@ SharedWorkerPool owns the generic mechanics:
 - node-local scratch and non-credential cache setup;
 - delegation from a generic pool worker into app-specific worker modules.
 
-The runtime helpers also include `host_load_cpu_basis()` and
-`host_load_is_high()` for dense app workers that perform their own load
-admission. These helpers compare host-wide load averages against
+The runtime helpers also include `resource_admission()` for dense app workers
+that decide whether to claim another unit of work. It covers configured
+capacity, scratch disk headroom, system and allocation memory headroom, and
+host load. Host-wide load averages are compared against
 `max(allocated_cpus, visible_cpus)`, not just a small Slurm CPU allocation, so a
 healthy 32-core node is not treated as overloaded merely because a shared worker
-requested 2 CPUs.
+requested 2 CPUs. App repositories should adapt this shared decision to their
+own nouns, such as CodingWorkspace turns or CAIDA jobs, instead of reimplementing
+the admission math locally.
 
 Apps that use this package keep their own control-plane and job semantics. A
 configured app must provide:
