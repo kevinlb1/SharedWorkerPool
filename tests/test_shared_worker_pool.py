@@ -181,7 +181,51 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 max_jobs=400,
                 max_submit_per_cycle=100,
             ),
-            9,
+            10,
+        )
+
+    def test_warm_request_submits_waiting_worker(self) -> None:
+        needs = [
+            AppNeed(
+                name="codingworkspace",
+                queued_units=0,
+                running_units=0,
+                worker_capacity=4,
+                warm_requested_workers=1,
+            ),
+        ]
+
+        self.assertEqual(
+            desired_pool_submissions(
+                needs,
+                live_slurm_jobs=0,
+                min_idle_workers=0,
+                max_jobs=400,
+                max_submit_per_cycle=100,
+            ),
+            1,
+        )
+
+    def test_warm_request_is_spare_capacity_beyond_running_work(self) -> None:
+        needs = [
+            AppNeed(
+                name="codingworkspace",
+                queued_units=0,
+                running_units=4,
+                worker_capacity=4,
+                warm_requested_workers=1,
+            ),
+        ]
+
+        self.assertEqual(
+            desired_pool_submissions(
+                needs,
+                live_slurm_jobs=1,
+                min_idle_workers=0,
+                max_jobs=400,
+                max_submit_per_cycle=100,
+            ),
+            1,
         )
 
     def test_reads_generic_app_status_modes(self) -> None:
@@ -222,9 +266,21 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 {
                     "remoteWorkersEnabled": True,
                     "turns": {"queuedUnclaimed": 33, "runningRemote": 4},
+                    "warmPool": {"requestedWorkers": 1, "secondsRemaining": 600},
                 },
             ).needed_workers,
             3,
+        )
+        self.assertEqual(
+            app_need_from_status(
+                codingworkspace,
+                {
+                    "remoteWorkersEnabled": True,
+                    "turns": {"queuedUnclaimed": 0, "runningRemote": 0},
+                    "warmPool": {"requestedWorkers": 1, "secondsRemaining": 600},
+                },
+            ).target_workers,
+            1,
         )
 
     def test_adaptive_scaling_ramps_and_backs_off(self) -> None:

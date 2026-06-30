@@ -102,6 +102,7 @@ class AppNeed:
     worker_capacity: int
     enabled: bool = True
     restart_drain_active: bool = False
+    warm_requested_workers: int = 0
 
     @property
     def needed_workers(self) -> int:
@@ -112,6 +113,12 @@ class AppNeed:
     @property
     def active_workers(self) -> int:
         return math.ceil(max(0, self.running_units) / max(1, self.worker_capacity))
+
+    @property
+    def target_workers(self) -> int:
+        if not self.enabled or self.restart_drain_active:
+            return 0
+        return self.active_workers + max(self.needed_workers, max(0, self.warm_requested_workers))
 
 
 def _expand_path(value: str | Path) -> Path:
@@ -313,6 +320,8 @@ def fetch_app_status(app: PoolAppProfile, *, launcher_id: str) -> dict[str, Any]
 
 def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed:
     mode = app.status_mode
+    warm_pool = status.get("warmPool") if isinstance(status.get("warmPool"), dict) else {}
+    warm_requested_workers = max(0, int(warm_pool.get("requestedWorkers") or 0))
     if mode == "caida":
         jobs = status.get("jobs") if isinstance(status.get("jobs"), dict) else {}
         enabled = bool(status.get("clusterWorkersEnabled") or status.get("remoteWorkersEnabled"))
@@ -323,6 +332,7 @@ def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed
             worker_capacity=app.worker_capacity,
             enabled=app.enabled and enabled,
             restart_drain_active=bool(status.get("restartDrainActive")),
+            warm_requested_workers=warm_requested_workers,
         )
     if mode == "codingworkspace":
         turns = status.get("turns") if isinstance(status.get("turns"), dict) else {}
@@ -333,6 +343,7 @@ def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed
             worker_capacity=app.worker_capacity,
             enabled=app.enabled and bool(status.get("remoteWorkersEnabled")),
             restart_drain_active=bool(status.get("restartDrainActive")),
+            warm_requested_workers=warm_requested_workers,
         )
     raise ValueError(f"unknown shared worker app status_mode: {mode}")
 
@@ -348,9 +359,8 @@ def desired_pool_submissions(
     app_start_burst_overcommit: int = 0,
 ) -> int:
     active_needs = [need for need in needs if need.enabled and not need.restart_drain_active]
-    needed_workers = sum(need.needed_workers for need in active_needs)
-    any_work_active = any(need.queued_units or need.running_units for need in active_needs)
-    if any_work_active:
+    needed_workers = sum(need.target_workers for need in active_needs)
+    if any(need.queued_units or need.running_units for need in active_needs):
         needed_workers += max(0, int(min_idle_workers or 0))
     live_jobs = max(0, int(live_slurm_jobs or 0))
     submit_cap = max(0, int(max_submit_per_cycle or 0))
@@ -382,8 +392,10 @@ def app_need_to_payload(need: AppNeed) -> dict[str, Any]:
         "worker_capacity": need.worker_capacity,
         "enabled": need.enabled,
         "restart_drain_active": need.restart_drain_active,
+        "warm_requested_workers": need.warm_requested_workers,
         "needed_workers": need.needed_workers,
         "active_workers": need.active_workers,
+        "target_workers": need.target_workers,
     }
 
 
@@ -395,6 +407,7 @@ def app_need_from_payload(payload: dict[str, Any]) -> AppNeed:
         worker_capacity=max(1, int(payload.get("worker_capacity") or 1)),
         enabled=bool(payload.get("enabled", True)),
         restart_drain_active=bool(payload.get("restart_drain_active")),
+        warm_requested_workers=max(0, int(payload.get("warm_requested_workers") or 0)),
     )
 
 
@@ -518,7 +531,7 @@ def pool_worker_should_retire(config: PoolConfig) -> bool:
 
 def dispatch_state_has_activity(config: PoolConfig) -> bool:
     needs = read_dispatch_state_needs(config, allow_stale=True) or []
-    return any(need.enabled and (need.queued_units or need.running_units) for need in needs)
+    return any(need.enabled and (need.queued_units or need.running_units or need.warm_requested_workers) for need in needs)
 
 
 def report_launcher_status(
@@ -663,7 +676,8 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
     need_text = ", ".join(
         (
             f"{need.name}:queued={need.queued_units}:running={need.running_units}:"
-            f"cap={need.worker_capacity}:active_workers={need.active_workers}:needed={need.needed_workers}"
+            f"cap={need.worker_capacity}:active_workers={need.active_workers}:"
+            f"needed={need.needed_workers}:warm={need.warm_requested_workers}:target={need.target_workers}"
         )
         for need in needs
     )
