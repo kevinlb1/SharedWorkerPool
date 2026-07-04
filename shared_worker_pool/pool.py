@@ -640,7 +640,8 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
     control_started_at = time.monotonic()
     timing_breakdown: dict[str, float] = {}
     needs: list[AppNeed] = []
-    transient_failure = False
+    status_success_count = 0
+    status_failure_count = 0
     for app in config.apps:
         if not app.enabled:
             needs.append(
@@ -653,11 +654,12 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
             app_seconds = time.monotonic() - app_started_at
             needs.append(app_need_from_status(app, status))
             timing_breakdown[app.name] = app_seconds
+            status_success_count += 1
         except Exception as exc:
             if not is_transient_control_error(exc):
                 raise
             app_seconds = time.monotonic() - app_started_at
-            transient_failure = True
+            status_failure_count += 1
             timing_breakdown[app.name] = app_seconds
             needs.append(
                 AppNeed(name=app.name, queued_units=0, running_units=0, worker_capacity=app.worker_capacity, enabled=False)
@@ -673,7 +675,7 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
         scale.record_poll(
             active=active,
             control_plane_seconds=control_plane_seconds,
-            transient_failure=transient_failure,
+            transient_failure=bool(status_failure_count and status_success_count == 0),
             timings=timing_breakdown,
         )
         effective_max_jobs = scale.effective_max_jobs

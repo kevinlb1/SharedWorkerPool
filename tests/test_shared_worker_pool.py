@@ -309,6 +309,12 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 worker_capacity=4,
             )
             config = _config(root, (caida, codingworkspace))
+            object.__setattr__(config, "adaptive_scaling_enabled", True)
+            object.__setattr__(config, "adaptive_start_jobs", 16)
+            object.__setattr__(config, "adaptive_start_submit_per_cycle", 8)
+            object.__setattr__(config, "adaptive_min_jobs", 4)
+            object.__setattr__(config, "adaptive_min_submit_per_cycle", 2)
+            scale = PoolScaleState(config)
 
             def fake_status(app: PoolAppProfile, *, launcher_id: str) -> dict[str, object]:
                 if app.name == "codingworkspace":
@@ -320,9 +326,12 @@ class SharedWorkerPoolTests(unittest.TestCase):
 
             with patch("shared_worker_pool.pool.fetch_app_status", side_effect=fake_status), \
                 patch("shared_worker_pool.pool.live_slurm_job_count", return_value=0):
-                count = poll_launcher_once(config, dry_run=True)
+                count = poll_launcher_once(config, dry_run=True, scale=scale)
 
             self.assertEqual(count, 3)
+            self.assertEqual(scale.effective_max_jobs, 16)
+            self.assertEqual(scale.effective_max_submit_per_cycle, 8)
+            self.assertEqual(scale.last_reason, "healthy 1/3")
             payload = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
             apps = {item["name"]: item for item in payload["apps"]}
             self.assertTrue(apps["caida"]["enabled"])
