@@ -23,7 +23,7 @@ from shared_worker_pool import (
     resource_admission,
     write_dispatch_state,
 )
-from shared_worker_pool.pool import poll_launcher_once
+from shared_worker_pool.pool import poll_launcher_once, refresh_dispatch_state_from_worker
 from shared_worker_pool.runtime import LauncherRequestError
 
 
@@ -368,6 +368,45 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 with self.assertRaises(LauncherRequestError):
                     poll_launcher_once(config, dry_run=True)
 
+            payload = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "previous")
+            self.assertEqual(payload["apps"][0]["queued_units"], 8)
+
+    def test_worker_refresh_preserves_stale_dispatch_when_all_apps_unavailable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caida = PoolAppProfile(
+                name="caida",
+                control_url="https://example.test/CAIDA-Concierge",
+                token_file=root / "caida-token",
+                source_dir=root,
+                python="python3",
+                worker_module="app.worker",
+                status_mode="caida",
+                worker_capacity=4,
+            )
+            config = _config(root, (caida,))
+            write_dispatch_state(
+                config,
+                needs=[AppNeed(name="caida", queued_units=8, running_units=4, worker_capacity=4)],
+                live_slurm_jobs=2,
+                desired_submissions=1,
+                submitted_jobs=1,
+                status="previous",
+            )
+            payload = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
+            payload["expires_at"] = 0
+            config.dispatch_state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with patch(
+                "shared_worker_pool.pool.fetch_app_status",
+                side_effect=LauncherRequestError("caida unavailable", status_code=503),
+            ), patch("shared_worker_pool.pool.live_slurm_job_count", side_effect=AssertionError("unexpected squeue")):
+                needs = refresh_dispatch_state_from_worker(config, worker_id="worker-a")
+
+            self.assertIsNotNone(needs)
+            assert needs is not None
+            self.assertEqual(needs[0].queued_units, 8)
             payload = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["status"], "previous")
             self.assertEqual(payload["apps"][0]["queued_units"], 8)

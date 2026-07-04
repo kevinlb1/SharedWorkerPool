@@ -769,7 +769,10 @@ def refresh_dispatch_state_from_worker(config: PoolConfig, *, worker_id: str) ->
             current = read_dispatch_state_needs(config)
             if current is not None:
                 return current
+            stale_needs = read_dispatch_state_needs(config, allow_stale=True)
             needs: list[AppNeed] = []
+            status_success_count = 0
+            status_failure_count = 0
             for app in config.apps:
                 if not app.enabled:
                     needs.append(
@@ -785,9 +788,11 @@ def refresh_dispatch_state_from_worker(config: PoolConfig, *, worker_id: str) ->
                 try:
                     status = fetch_app_status(app, launcher_id=f"{worker_id}-dispatch-refresh")
                     needs.append(app_need_from_status(app, status))
+                    status_success_count += 1
                 except Exception as exc:
                     if not is_transient_control_error(exc):
                         raise
+                    status_failure_count += 1
                     launcher_log(f"worker {worker_id} could not refresh {app.name} dispatch status: {exc}")
                     needs.append(
                         AppNeed(
@@ -798,6 +803,11 @@ def refresh_dispatch_state_from_worker(config: PoolConfig, *, worker_id: str) ->
                             enabled=False,
                         )
                     )
+            if status_failure_count and status_success_count == 0:
+                if stale_needs is not None:
+                    launcher_log(f"worker {worker_id} preserving stale dispatch state after all app status polls failed")
+                    return stale_needs
+                raise LauncherRequestError("all enabled app status polls failed during worker dispatch refresh")
             try:
                 live_jobs = live_slurm_job_count(config.job_name, config.slurm_user)
             except Exception as exc:
