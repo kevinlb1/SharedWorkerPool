@@ -640,6 +640,7 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
     control_started_at = time.monotonic()
     timing_breakdown: dict[str, float] = {}
     needs: list[AppNeed] = []
+    transient_failure = False
     for app in config.apps:
         if not app.enabled:
             needs.append(
@@ -647,10 +648,21 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
             )
             continue
         app_started_at = time.monotonic()
-        status = fetch_app_status(app, launcher_id=config.launcher_id)
-        app_seconds = time.monotonic() - app_started_at
-        needs.append(app_need_from_status(app, status))
-        timing_breakdown[app.name] = app_seconds
+        try:
+            status = fetch_app_status(app, launcher_id=config.launcher_id)
+            app_seconds = time.monotonic() - app_started_at
+            needs.append(app_need_from_status(app, status))
+            timing_breakdown[app.name] = app_seconds
+        except Exception as exc:
+            if not is_transient_control_error(exc):
+                raise
+            app_seconds = time.monotonic() - app_started_at
+            transient_failure = True
+            timing_breakdown[app.name] = app_seconds
+            needs.append(
+                AppNeed(name=app.name, queued_units=0, running_units=0, worker_capacity=app.worker_capacity, enabled=False)
+            )
+            launcher_log(f"shared launcher skipping unavailable app {app.name}: {exc}")
     squeue_started_at = time.monotonic()
     live_jobs = live_slurm_job_count(config.job_name, config.slurm_user)
     squeue_seconds = time.monotonic() - squeue_started_at
@@ -658,7 +670,12 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
     active = any(need.enabled and (need.queued_units or need.running_units) for need in needs)
     if scale is not None:
         timing_breakdown["squeue"] = squeue_seconds
-        scale.record_poll(active=active, control_plane_seconds=control_plane_seconds, timings=timing_breakdown)
+        scale.record_poll(
+            active=active,
+            control_plane_seconds=control_plane_seconds,
+            transient_failure=transient_failure,
+            timings=timing_breakdown,
+        )
         effective_max_jobs = scale.effective_max_jobs
         effective_max_submit_per_cycle = scale.effective_max_submit_per_cycle
     else:

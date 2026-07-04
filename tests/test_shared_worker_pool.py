@@ -23,6 +23,8 @@ from shared_worker_pool import (
     resource_admission,
     write_dispatch_state,
 )
+from shared_worker_pool.pool import poll_launcher_once
+from shared_worker_pool.runtime import LauncherRequestError
 
 
 def _config(root: Path, apps: tuple[PoolAppProfile, ...]) -> PoolConfig:
@@ -282,6 +284,50 @@ class SharedWorkerPoolTests(unittest.TestCase):
             ).target_workers,
             1,
         )
+
+    def test_launcher_skips_unavailable_app_and_submits_for_healthy_app(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caida = PoolAppProfile(
+                name="caida",
+                control_url="https://example.test/CAIDA-Concierge",
+                token_file=root / "caida-token",
+                source_dir=root,
+                python="python3",
+                worker_module="app.worker",
+                status_mode="caida",
+                worker_capacity=4,
+            )
+            codingworkspace = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "cw-token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                worker_capacity=4,
+            )
+            config = _config(root, (caida, codingworkspace))
+
+            def fake_status(app: PoolAppProfile, *, launcher_id: str) -> dict[str, object]:
+                if app.name == "codingworkspace":
+                    raise LauncherRequestError("coding workspace unavailable", status_code=500)
+                return {
+                    "clusterWorkersEnabled": True,
+                    "jobs": {"queuedUnclaimed": 12, "runningTotal": 0},
+                }
+
+            with patch("shared_worker_pool.pool.fetch_app_status", side_effect=fake_status), \
+                patch("shared_worker_pool.pool.live_slurm_job_count", return_value=0):
+                count = poll_launcher_once(config, dry_run=True)
+
+            self.assertEqual(count, 3)
+            payload = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
+            apps = {item["name"]: item for item in payload["apps"]}
+            self.assertTrue(apps["caida"]["enabled"])
+            self.assertEqual(apps["caida"]["queued_units"], 12)
+            self.assertFalse(apps["codingworkspace"]["enabled"])
 
     def test_adaptive_scaling_ramps_and_backs_off(self) -> None:
         with TemporaryDirectory() as tmp:
