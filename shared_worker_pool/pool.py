@@ -665,6 +665,8 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
                 AppNeed(name=app.name, queued_units=0, running_units=0, worker_capacity=app.worker_capacity, enabled=False)
             )
             launcher_log(f"shared launcher skipping unavailable app {app.name}: {exc}")
+    if status_failure_count and status_success_count == 0:
+        raise LauncherRequestError("all enabled app status polls failed")
     squeue_started_at = time.monotonic()
     live_jobs = live_slurm_job_count(config.job_name, config.slurm_user)
     squeue_seconds = time.monotonic() - squeue_started_at
