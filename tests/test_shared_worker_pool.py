@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -8,7 +9,6 @@ from unittest.mock import patch
 
 from shared_worker_pool import runtime as runtime_module
 from shared_worker_pool import (
-    POOL_WORKER_VERSION,
     AppNeed,
     PoolAppProfile,
     PoolConfig,
@@ -19,6 +19,7 @@ from shared_worker_pool import (
     dispatch_required_worker_version,
     host_load_cpu_basis,
     host_load_is_high,
+    pool_worker_config_version,
     pool_worker_should_retire,
     resource_admission,
     write_dispatch_state,
@@ -499,13 +500,46 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 status="idle",
             )
             payload = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["required_worker_version"], POOL_WORKER_VERSION)
-            self.assertEqual(dispatch_required_worker_version(config), POOL_WORKER_VERSION)
+            expected_version = pool_worker_config_version(config)
+            self.assertEqual(payload["required_worker_version"], expected_version)
+            self.assertEqual(dispatch_required_worker_version(config), expected_version)
             self.assertFalse(pool_worker_should_retire(config))
 
             payload["required_worker_version"] = "shared-worker-pool-worker-next"
             config.dispatch_state_path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertTrue(pool_worker_should_retire(config))
+
+    def test_worker_version_changes_with_delegated_capacity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="caida",
+                control_url="https://example.test/CAIDA-Concierge",
+                token_file=root / "caida-token",
+                source_dir=root,
+                python="python3",
+                worker_module="app.worker",
+                status_mode="caida",
+                worker_capacity=4,
+            )
+            old_config = _config(root, (app,))
+            new_config = _config(root, (replace(app, worker_capacity=8),))
+
+            self.assertNotEqual(
+                pool_worker_config_version(old_config),
+                pool_worker_config_version(new_config),
+            )
+
+            write_dispatch_state(
+                new_config,
+                needs=[AppNeed(name="caida", queued_units=1, running_units=0, worker_capacity=8)],
+                live_slurm_jobs=1,
+                desired_submissions=0,
+                submitted_jobs=0,
+                status="idle",
+            )
+            self.assertTrue(pool_worker_should_retire(old_config))
+            self.assertFalse(pool_worker_should_retire(new_config))
 
 
 if __name__ == "__main__":

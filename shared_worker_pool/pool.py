@@ -423,6 +423,7 @@ def dispatch_state_payload(
     scale: PoolScaleState | None = None,
 ) -> dict[str, Any]:
     now = time.time()
+    worker_version = pool_worker_config_version(config)
     scale_payload = scale.payload() if scale else {
         "enabled": False,
         "effective_max_jobs": config.max_jobs,
@@ -435,8 +436,8 @@ def dispatch_state_payload(
     return {
         "version": POOL_LAUNCHER_VERSION,
         "launcher_version": POOL_LAUNCHER_VERSION,
-        "worker_version": POOL_WORKER_VERSION,
-        "required_worker_version": POOL_WORKER_VERSION,
+        "worker_version": worker_version,
+        "required_worker_version": worker_version,
         "launcher_id": config.launcher_id,
         "hostname": socket.gethostname(),
         "updated_at": now,
@@ -524,9 +525,34 @@ def dispatch_required_worker_version(config: PoolConfig, *, allow_stale: bool = 
     return cleaned or None
 
 
+def pool_worker_config_version(config: PoolConfig) -> str:
+    material = {
+        "worker_poll_seconds": config.worker_poll_seconds,
+        "worker_idle_timeout_seconds": config.worker_idle_timeout_seconds,
+        "worker_max_runtime_seconds": config.worker_max_runtime_seconds,
+        "worker_task_timeout_seconds": config.worker_task_timeout_seconds,
+        "apps": [
+            {
+                "name": app.name,
+                "enabled": app.enabled,
+                "control_url": app.control_url,
+                "source_dir": str(app.source_dir),
+                "python": app.python,
+                "worker_module": app.worker_module,
+                "worker_capacity": app.worker_capacity,
+                "worker_args": list(app.worker_args),
+                "env": dict(sorted(app.env.items())),
+            }
+            for app in config.apps
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return f"{POOL_WORKER_VERSION}-{digest}"
+
+
 def pool_worker_should_retire(config: PoolConfig) -> bool:
     required_version = dispatch_required_worker_version(config)
-    return bool(required_version and required_version != POOL_WORKER_VERSION)
+    return bool(required_version and required_version != pool_worker_config_version(config))
 
 
 def dispatch_state_has_activity(config: PoolConfig) -> bool:
@@ -934,7 +960,7 @@ def run_pool_worker(config: PoolConfig, *, worker_id: str, scratch_root: Path) -
             launcher_log(
                 (
                     f"shared pool worker {worker_id} retiring for worker version "
-                    f"{required_version}; local version is {POOL_WORKER_VERSION}"
+                    f"{required_version}; local version is {pool_worker_config_version(config)}"
                 )
             )
             return 0
