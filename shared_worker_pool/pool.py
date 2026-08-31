@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -32,8 +33,9 @@ from shared_worker_pool.runtime import (
 )
 
 
-POOL_LAUNCHER_VERSION = "shared-worker-pool-20260629-fairness"
-POOL_WORKER_VERSION = "shared-worker-pool-worker-20260629-fairness"
+POOL_LAUNCHER_VERSION = "shared-worker-pool-20260830-persistent-warm"
+POOL_WORKER_VERSION = "shared-worker-pool-worker-20260830-persistent-warm"
+WARM_LEASE_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class PoolAppProfile:
     env: dict[str, str] = field(default_factory=dict)
     launcher_status_path: str = ""
     enabled: bool = True
+    persistent_warm_workers: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,9 @@ class PoolConfig:
     adaptive_reset_when_idle: bool = True
     app_start_burst_workers: int = 0
     app_start_burst_overcommit: int = 0
+    warm_lease_state_path: Path | None = None
+    warm_lease_heartbeat_seconds: float = 5.0
+    warm_lease_ttl_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,7 @@ class AppNeed:
     enabled: bool = True
     restart_drain_active: bool = False
     warm_requested_workers: int = 0
+    warm_request_expires_at: float = 0.0
 
     @property
     def needed_workers(self) -> int:
@@ -119,6 +126,12 @@ class AppNeed:
         if not self.enabled or self.restart_drain_active:
             return 0
         return self.active_workers + max(self.needed_workers, max(0, self.warm_requested_workers))
+
+    def warm_request_is_active(self, *, now: float | None = None) -> bool:
+        if self.warm_requested_workers <= 0:
+            return False
+        expires_at = max(0.0, float(self.warm_request_expires_at or 0.0))
+        return not expires_at or expires_at > (time.time() if now is None else now)
 
 
 def _expand_path(value: str | Path) -> Path:
@@ -156,12 +169,18 @@ def load_pool_config(path: Path) -> PoolConfig:
                 env={str(key): str(value) for key, value in (item.get("env") or {}).items()},
                 launcher_status_path=str(item.get("launcher_status_path") or ""),
                 enabled=bool(item.get("enabled", True)),
+                persistent_warm_workers=max(0, int(item.get("persistent_warm_workers") or 0)),
             )
         )
     if not apps:
         raise ValueError("shared worker pool config must contain at least one app profile")
     max_jobs = max(0, int(pool.get("max_jobs") or 400))
     max_submit_per_cycle = max(0, int(pool.get("max_submit_per_cycle") or 100))
+    warm_lease_heartbeat_seconds = max(1.0, float(pool.get("warm_lease_heartbeat_seconds") or 5.0))
+    warm_lease_ttl_seconds = max(
+        warm_lease_heartbeat_seconds * 3.0,
+        float(pool.get("warm_lease_ttl_seconds") or 30.0),
+    )
     return PoolConfig(
         config_path=path.resolve(),
         apps=tuple(apps),
@@ -213,6 +232,14 @@ def load_pool_config(path: Path) -> PoolConfig:
         adaptive_reset_when_idle=bool(pool.get("adaptive_reset_when_idle", True)),
         app_start_burst_workers=max(0, int(pool.get("app_start_burst_workers") or 0)),
         app_start_burst_overcommit=max(0, int(pool.get("app_start_burst_overcommit") or 0)),
+        warm_lease_state_path=_expand_path(
+            pool.get("warm_lease_state_path")
+            or Path(pool.get("dispatch_state_path") or "~/shared-worker-pool/dispatch_state.json").with_name(
+                "warm_leases.json"
+            )
+        ),
+        warm_lease_heartbeat_seconds=warm_lease_heartbeat_seconds,
+        warm_lease_ttl_seconds=warm_lease_ttl_seconds,
     )
 
 
@@ -322,6 +349,13 @@ def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed
     mode = app.status_mode
     warm_pool = status.get("warmPool") if isinstance(status.get("warmPool"), dict) else {}
     warm_requested_workers = max(0, int(warm_pool.get("requestedWorkers") or 0))
+    if app.persistent_warm_workers:
+        warm_requested_workers = min(warm_requested_workers, app.persistent_warm_workers)
+    try:
+        warm_seconds_remaining = max(0.0, float(warm_pool.get("secondsRemaining") or 0.0))
+    except (TypeError, ValueError):
+        warm_seconds_remaining = 0.0
+    warm_request_expires_at = time.time() + warm_seconds_remaining if warm_seconds_remaining else 0.0
     if mode == "caida":
         jobs = status.get("jobs") if isinstance(status.get("jobs"), dict) else {}
         enabled = bool(status.get("clusterWorkersEnabled") or status.get("remoteWorkersEnabled"))
@@ -333,6 +367,7 @@ def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed
             enabled=app.enabled and enabled,
             restart_drain_active=bool(status.get("restartDrainActive")),
             warm_requested_workers=warm_requested_workers,
+            warm_request_expires_at=warm_request_expires_at,
         )
     if mode == "codingworkspace":
         turns = status.get("turns") if isinstance(status.get("turns"), dict) else {}
@@ -344,6 +379,7 @@ def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed
             enabled=app.enabled and bool(status.get("remoteWorkersEnabled")),
             restart_drain_active=bool(status.get("restartDrainActive")),
             warm_requested_workers=warm_requested_workers,
+            warm_request_expires_at=warm_request_expires_at,
         )
     raise ValueError(f"unknown shared worker app status_mode: {mode}")
 
@@ -357,9 +393,11 @@ def desired_pool_submissions(
     max_submit_per_cycle: int,
     app_start_burst_workers: int = 0,
     app_start_burst_overcommit: int = 0,
+    persistent_warm_tail_workers: int = 0,
 ) -> int:
     active_needs = [need for need in needs if need.enabled and not need.restart_drain_active]
     needed_workers = sum(need.target_workers for need in active_needs)
+    needed_workers += max(0, int(persistent_warm_tail_workers or 0))
     if any(need.queued_units or need.running_units for need in active_needs):
         needed_workers += max(0, int(min_idle_workers or 0))
     live_jobs = max(0, int(live_slurm_jobs or 0))
@@ -393,6 +431,7 @@ def app_need_to_payload(need: AppNeed) -> dict[str, Any]:
         "enabled": need.enabled,
         "restart_drain_active": need.restart_drain_active,
         "warm_requested_workers": need.warm_requested_workers,
+        "warm_request_expires_at": need.warm_request_expires_at,
         "needed_workers": need.needed_workers,
         "active_workers": need.active_workers,
         "target_workers": need.target_workers,
@@ -408,6 +447,7 @@ def app_need_from_payload(payload: dict[str, Any]) -> AppNeed:
         enabled=bool(payload.get("enabled", True)),
         restart_drain_active=bool(payload.get("restart_drain_active")),
         warm_requested_workers=max(0, int(payload.get("warm_requested_workers") or 0)),
+        warm_request_expires_at=max(0.0, float(payload.get("warm_request_expires_at") or 0.0)),
     )
 
 
@@ -525,12 +565,246 @@ def dispatch_required_worker_version(config: PoolConfig, *, allow_stale: bool = 
     return cleaned or None
 
 
+def warm_lease_state_path(config: PoolConfig) -> Path:
+    if config.warm_lease_state_path is not None:
+        return config.warm_lease_state_path
+    return config.dispatch_state_path.with_name("warm_leases.json")
+
+
+def warm_lease_lock_path(config: PoolConfig) -> Path:
+    path = warm_lease_state_path(config)
+    return path.with_suffix(path.suffix + ".lock")
+
+
+def _read_warm_leases_unlocked(config: PoolConfig) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(warm_lease_state_path(config).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(payload, dict) or payload.get("version") != WARM_LEASE_STATE_VERSION:
+        return []
+    leases = payload.get("leases")
+    if not isinstance(leases, list):
+        return []
+    return [dict(item) for item in leases if isinstance(item, dict)]
+
+
+def _current_warm_leases_unlocked(
+    config: PoolConfig,
+    *,
+    now: float,
+) -> list[dict[str, Any]]:
+    current: list[dict[str, Any]] = []
+    seen_workers: set[str] = set()
+    for lease in _read_warm_leases_unlocked(config):
+        app_name = str(lease.get("app") or "").strip()
+        worker_id = str(lease.get("worker_id") or "").strip()
+        try:
+            heartbeat_at = float(lease.get("heartbeat_at") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not app_name or not worker_id or worker_id in seen_workers:
+            continue
+        if not math.isfinite(heartbeat_at):
+            continue
+        if heartbeat_at < now - config.warm_lease_ttl_seconds:
+            continue
+        if heartbeat_at > now + config.warm_lease_ttl_seconds:
+            continue
+        lease["app"] = app_name
+        lease["worker_id"] = worker_id
+        lease["heartbeat_at"] = heartbeat_at
+        current.append(lease)
+        seen_workers.add(worker_id)
+    return current
+
+
+def _write_warm_leases_unlocked(
+    config: PoolConfig,
+    leases: list[dict[str, Any]],
+    *,
+    now: float,
+) -> None:
+    path = warm_lease_state_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "version": WARM_LEASE_STATE_VERSION,
+                "updated_at": now,
+                "leases": leases,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _with_warm_lease_lock(config: PoolConfig, callback: Any) -> Any:
+    lock_path = warm_lease_lock_path(config)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            return callback()
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def claim_persistent_warm_app(
+    config: PoolConfig,
+    needs: list[AppNeed],
+    *,
+    worker_id: str,
+    now: float | None = None,
+) -> PoolAppProfile | None:
+    """Atomically reserve at most one persistent warm child for this pool worker."""
+
+    checked_at = time.time() if now is None else float(now)
+    need_by_name = {need.name: need for need in needs}
+    eligible: list[tuple[PoolAppProfile, AppNeed, int]] = []
+    for app in config.apps:
+        if not app.enabled or app.persistent_warm_workers <= 0:
+            continue
+        need = need_by_name.get(app.name)
+        if need is None or not need.enabled or need.restart_drain_active:
+            continue
+        if not need.warm_request_is_active(now=checked_at):
+            continue
+        limit = min(app.persistent_warm_workers, max(0, need.warm_requested_workers))
+        if limit > 0:
+            eligible.append((app, need, limit))
+    if not eligible:
+        return None
+
+    def claim() -> PoolAppProfile | None:
+        leases = _current_warm_leases_unlocked(config, now=checked_at)
+        existing = next((lease for lease in leases if lease["worker_id"] == worker_id), None)
+        if existing is not None:
+            app = next((item[0] for item in eligible if item[0].name == existing["app"]), None)
+            if app is not None:
+                existing["heartbeat_at"] = checked_at
+                _write_warm_leases_unlocked(config, leases, now=checked_at)
+                return app
+            leases = [lease for lease in leases if lease["worker_id"] != worker_id]
+            _write_warm_leases_unlocked(config, leases, now=checked_at)
+
+        for app, need, limit in eligible:
+            active = sum(1 for lease in leases if lease["app"] == app.name)
+            if active >= limit:
+                continue
+            leases.append(
+                {
+                    "app": app.name,
+                    "worker_id": worker_id,
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "claimed_at": checked_at,
+                    "heartbeat_at": checked_at,
+                    "request_expires_at": need.warm_request_expires_at,
+                    "worker_version": pool_worker_config_version(config),
+                }
+            )
+            _write_warm_leases_unlocked(config, leases, now=checked_at)
+            return app
+        return None
+
+    return _with_warm_lease_lock(config, claim)
+
+
+def heartbeat_persistent_warm_lease(
+    config: PoolConfig,
+    *,
+    app_name: str,
+    worker_id: str,
+    now: float | None = None,
+) -> bool:
+    checked_at = time.time() if now is None else float(now)
+
+    def heartbeat() -> bool:
+        leases = _current_warm_leases_unlocked(config, now=checked_at)
+        for lease in leases:
+            if lease["app"] == app_name and lease["worker_id"] == worker_id:
+                lease["heartbeat_at"] = checked_at
+                _write_warm_leases_unlocked(config, leases, now=checked_at)
+                return True
+        app = next(
+            (
+                profile
+                for profile in config.apps
+                if profile.name == app_name and profile.enabled and profile.persistent_warm_workers > 0
+            ),
+            None,
+        )
+        if app is None:
+            _write_warm_leases_unlocked(config, leases, now=checked_at)
+            return False
+        leases.append(
+            {
+                "app": app_name,
+                "worker_id": worker_id,
+                "hostname": socket.gethostname(),
+                "pid": os.getpid(),
+                "claimed_at": checked_at,
+                "heartbeat_at": checked_at,
+                "request_expires_at": 0.0,
+                "worker_version": pool_worker_config_version(config),
+                "recovered": True,
+            }
+        )
+        _write_warm_leases_unlocked(config, leases, now=checked_at)
+        return True
+
+    return bool(_with_warm_lease_lock(config, heartbeat))
+
+
+def release_persistent_warm_lease(
+    config: PoolConfig,
+    *,
+    app_name: str,
+    worker_id: str,
+    now: float | None = None,
+) -> None:
+    checked_at = time.time() if now is None else float(now)
+
+    def release() -> None:
+        leases = [
+            lease
+            for lease in _current_warm_leases_unlocked(config, now=checked_at)
+            if not (lease["app"] == app_name and lease["worker_id"] == worker_id)
+        ]
+        _write_warm_leases_unlocked(config, leases, now=checked_at)
+
+    _with_warm_lease_lock(config, release)
+
+
+def active_persistent_warm_leases(
+    config: PoolConfig,
+    *,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    checked_at = time.time() if now is None else float(now)
+
+    def read() -> list[dict[str, Any]]:
+        leases = _current_warm_leases_unlocked(config, now=checked_at)
+        _write_warm_leases_unlocked(config, leases, now=checked_at)
+        return [dict(lease) for lease in leases]
+
+    return _with_warm_lease_lock(config, read)
+
+
 def pool_worker_config_version(config: PoolConfig) -> str:
     material = {
         "worker_poll_seconds": config.worker_poll_seconds,
         "worker_idle_timeout_seconds": config.worker_idle_timeout_seconds,
         "worker_max_runtime_seconds": config.worker_max_runtime_seconds,
         "worker_task_timeout_seconds": config.worker_task_timeout_seconds,
+        "warm_lease_state_path": str(warm_lease_state_path(config)),
+        "warm_lease_heartbeat_seconds": config.warm_lease_heartbeat_seconds,
+        "warm_lease_ttl_seconds": config.warm_lease_ttl_seconds,
         "apps": [
             {
                 "name": app.name,
@@ -542,6 +816,7 @@ def pool_worker_config_version(config: PoolConfig) -> str:
                 "worker_capacity": app.worker_capacity,
                 "worker_args": list(app.worker_args),
                 "env": dict(sorted(app.env.items())),
+                "persistent_warm_workers": app.persistent_warm_workers,
             }
             for app in config.apps
         ],
@@ -557,7 +832,11 @@ def pool_worker_should_retire(config: PoolConfig) -> bool:
 
 def dispatch_state_has_activity(config: PoolConfig) -> bool:
     needs = read_dispatch_state_needs(config, allow_stale=True) or []
-    return any(need.enabled and (need.queued_units or need.running_units or need.warm_requested_workers) for need in needs)
+    now = time.time()
+    return any(
+        need.enabled and (need.queued_units or need.running_units or need.warm_request_is_active(now=now))
+        for need in needs
+    )
 
 
 def report_launcher_status(
@@ -711,6 +990,31 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
     else:
         effective_max_jobs = config.max_jobs
         effective_max_submit_per_cycle = config.max_submit_per_cycle
+    persistent_warm_leases: list[dict[str, Any]] = []
+    if any(app.enabled and app.persistent_warm_workers > 0 for app in config.apps):
+        try:
+            persistent_warm_leases = active_persistent_warm_leases(config)
+        except Exception as exc:
+            launcher_log(f"shared launcher could not read persistent warm leases: {type(exc).__name__}: {exc}")
+    persistent_app_limits = {
+        app.name: app.persistent_warm_workers
+        for app in config.apps
+        if app.enabled and app.persistent_warm_workers > 0
+    }
+    current_persistent_requests = {
+        need.name: min(persistent_app_limits.get(need.name, 0), max(0, need.warm_requested_workers))
+        for need in needs
+        if need.enabled and not need.restart_drain_active
+    }
+    persistent_lease_counts: dict[str, int] = {}
+    for lease in persistent_warm_leases:
+        app_name = str(lease.get("app") or "")
+        persistent_lease_counts[app_name] = persistent_lease_counts.get(app_name, 0) + 1
+    matched_persistent_workers = sum(
+        min(lease_count, current_persistent_requests.get(app_name, 0))
+        for app_name, lease_count in persistent_lease_counts.items()
+    )
+    persistent_warm_tail_workers = max(0, len(persistent_warm_leases) - matched_persistent_workers)
     count = desired_pool_submissions(
         needs,
         live_slurm_jobs=live_jobs,
@@ -719,6 +1023,7 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
         max_submit_per_cycle=effective_max_submit_per_cycle,
         app_start_burst_workers=config.app_start_burst_workers,
         app_start_burst_overcommit=config.app_start_burst_overcommit,
+        persistent_warm_tail_workers=persistent_warm_tail_workers,
     )
     need_text = ", ".join(
         (
@@ -736,7 +1041,11 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
         )
     else:
         scale_text = f"max={effective_max_jobs} submit_cap={effective_max_submit_per_cycle}"
-    launcher_log(f"shared status live={live_jobs} submit={count} {scale_text} {need_text}")
+    launcher_log(
+        f"shared status live={live_jobs} persistent_warm={len(persistent_warm_leases)} "
+        f"persistent_warm_tail={persistent_warm_tail_workers} "
+        f"submit={count} {scale_text} {need_text}"
+    )
     output = ""
     submitted = 0
     if count > 0:
@@ -912,13 +1221,13 @@ def app_python_command(app: PoolAppProfile) -> str:
     return python
 
 
-def run_app_worker_once(
+def app_worker_command(
     app: PoolAppProfile,
     *,
     pool_worker_id: str,
     scratch_root: Path,
-    task_timeout_seconds: float,
-) -> int:
+    once: bool,
+) -> tuple[list[str], Path, dict[str, str]]:
     app_scratch = scratch_root / app.name
     app_scratch.mkdir(parents=True, exist_ok=True)
     command = [
@@ -933,11 +1242,28 @@ def run_app_worker_once(
         f"{pool_worker_id}-{app.name}",
         "--scratch-root",
         str(app_scratch),
-        "--once",
-        *app.worker_args,
     ]
+    if once:
+        command.append("--once")
+    command.extend(app.worker_args)
     env = os.environ.copy()
     env.update(app.env)
+    return command, app_scratch, env
+
+
+def run_app_worker_once(
+    app: PoolAppProfile,
+    *,
+    pool_worker_id: str,
+    scratch_root: Path,
+    task_timeout_seconds: float,
+) -> int:
+    command, _app_scratch, env = app_worker_command(
+        app,
+        pool_worker_id=pool_worker_id,
+        scratch_root=scratch_root,
+        once=True,
+    )
     launcher_log(f"pool worker {pool_worker_id} delegating to {app.name}")
     result = subprocess.run(
         command,
@@ -948,11 +1274,78 @@ def run_app_worker_once(
     return int(result.returncode or 0)
 
 
+def _stop_persistent_child(process: subprocess.Popen[Any], *, worker_id: str, app_name: str) -> None:
+    if process.poll() is not None:
+        return
+    launcher_log(f"pool worker {worker_id} stopping persistent {app_name} child")
+    process.terminate()
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        launcher_log(f"pool worker {worker_id} killing unresponsive persistent {app_name} child")
+        process.kill()
+        process.wait(timeout=10)
+
+
+def run_persistent_app_worker(
+    config: PoolConfig,
+    app: PoolAppProfile,
+    *,
+    pool_worker_id: str,
+    scratch_root: Path,
+) -> int:
+    command, _app_scratch, env = app_worker_command(
+        app,
+        pool_worker_id=pool_worker_id,
+        scratch_root=scratch_root,
+        once=False,
+    )
+    launcher_log(f"pool worker {pool_worker_id} starting persistent warm {app.name} child")
+    process: subprocess.Popen[Any] | None = None
+    try:
+        process = subprocess.Popen(command, cwd=app.source_dir, env=env)
+        lease_loss_logged = False
+        while True:
+            try:
+                return int(process.wait(timeout=config.warm_lease_heartbeat_seconds) or 0)
+            except subprocess.TimeoutExpired:
+                try:
+                    maintained = heartbeat_persistent_warm_lease(
+                        config,
+                        app_name=app.name,
+                        worker_id=pool_worker_id,
+                    )
+                except Exception as exc:
+                    launcher_log(
+                        f"pool worker {pool_worker_id} could not heartbeat its persistent {app.name} lease: {exc}"
+                    )
+                    continue
+                if not maintained and not lease_loss_logged:
+                    lease_loss_logged = True
+                    launcher_log(
+                        f"pool worker {pool_worker_id} lost its persistent {app.name} lease; child will finish normally"
+                    )
+    except BaseException:
+        if process is not None:
+            _stop_persistent_child(process, worker_id=pool_worker_id, app_name=app.name)
+        raise
+    finally:
+        try:
+            release_persistent_warm_lease(
+                config,
+                app_name=app.name,
+                worker_id=pool_worker_id,
+            )
+        except Exception as exc:
+            launcher_log(f"pool worker {pool_worker_id} could not release its persistent {app.name} lease: {exc}")
+
+
 def run_pool_worker(config: PoolConfig, *, worker_id: str, scratch_root: Path) -> int:
     scratch_root.mkdir(parents=True, exist_ok=True)
     started_at = time.monotonic()
     last_work_at = started_at
     failures = 0
+    next_warm_claim_at = started_at
     launcher_log(f"shared pool worker {worker_id} started")
     while True:
         if pool_worker_should_retire(config):
@@ -970,7 +1363,43 @@ def run_pool_worker(config: PoolConfig, *, worker_id: str, scratch_root: Path) -
         if config.worker_idle_timeout_seconds and time.monotonic() - last_work_at >= config.worker_idle_timeout_seconds:
             launcher_log(f"shared pool worker {worker_id} idle timeout reached")
             return 1 if failures else 0
-        candidates = candidate_apps(config, worker_id=worker_id)
+        needs = read_dispatch_state_needs(config)
+        if needs is None:
+            needs = refresh_dispatch_state_from_worker(config, worker_id=worker_id)
+        now = time.monotonic()
+        warm_app = None
+        if needs is not None and now >= next_warm_claim_at:
+            warm_app = claim_persistent_warm_app(config, needs, worker_id=worker_id)
+            if warm_app is None:
+                jitter = int(hashlib.sha256(worker_id.encode("utf-8")).hexdigest()[:4], 16) % 1000 / 1000.0
+                next_warm_claim_at = now + config.warm_lease_heartbeat_seconds * (1.0 + jitter)
+        if warm_app is not None:
+            try:
+                code = run_persistent_app_worker(
+                    config,
+                    warm_app,
+                    pool_worker_id=worker_id,
+                    scratch_root=scratch_root,
+                )
+            except Exception as exc:
+                failures += 1
+                launcher_log(
+                    f"pool worker {worker_id} failed while warming {warm_app.name}: {type(exc).__name__}: {exc}"
+                )
+                time.sleep(config.worker_poll_seconds)
+                continue
+            last_work_at = time.monotonic()
+            next_warm_claim_at = last_work_at
+            if code:
+                failures += 1
+                launcher_log(f"pool worker {worker_id} persistent {warm_app.name} child exited with {code}")
+                next_warm_claim_at = last_work_at + max(
+                    config.worker_poll_seconds,
+                    config.warm_lease_heartbeat_seconds,
+                )
+                time.sleep(config.worker_poll_seconds)
+            continue
+        candidates = candidate_apps_from_needs(config, needs or [], worker_id=worker_id)
         if not candidates:
             time.sleep(config.worker_poll_seconds)
             continue
@@ -1041,7 +1470,16 @@ def main(argv: list[str] | None = None) -> int:
     config = load_pool_config(args.config)
     if args.mode == "launcher":
         return run_launcher_loop(config, once=args.once, dry_run=args.dry_run)
-    return run_pool_worker(config, worker_id=args.worker_id, scratch_root=args.scratch_root)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def terminate_worker(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate_worker)
+    try:
+        return run_pool_worker(config, worker_id=args.worker_id, scratch_root=args.scratch_root)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

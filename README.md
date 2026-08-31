@@ -9,6 +9,7 @@ SharedWorkerPool owns the generic mechanics:
 - fair shared Slurm demand calculation across apps;
 - adaptive worker submission and backoff;
 - local dispatch-state snapshots so every worker does not poll every app;
+- optional, lease-coordinated persistent warm children for latency-sensitive apps;
 - worker retirement when the launcher requires a newer worker version;
 - Slurm worker submission wrappers;
 - node-local scratch and non-credential cache setup;
@@ -34,6 +35,34 @@ configured app must provide:
 
 CAIDA Concierge and CodingWorkspace are the first two app profiles, but this
 package is intentionally app-agnostic.
+
+## Persistent warm children
+
+An app profile can set `persistent_warm_workers` to a positive limit. While
+that app's fresh control-plane status requests warm workers, generic pool jobs
+atomically compete for that many slots in `warm_lease_state_path`. A winner
+runs the app worker without `--once`, so its imports, runtime initialization,
+and app-owned caches remain ready between units of work. All other generic jobs
+continue through the normal fair one-shot dispatcher.
+
+The parent pool worker heartbeats its lease while the child runs. Leases older
+than `warm_lease_ttl_seconds` are recoverable after a dead Slurm job, and the
+lease limit is additionally capped by the control plane's current
+`warmPool.requestedWorkers`. A fresh lease owned by an older worker version is
+kept until that child exits, preventing config rotation from starting a second
+warm child beside an active old one. New claims are refused while an app is
+draining or after `warmPool.secondsRemaining` expires. An already-running child
+is never killed merely because the warm request expires; the app worker's own
+idle timeout lets active work finish and provides the post-turn warm window.
+If a login refresh arrives just as that idle timeout fires, the lease is
+released and a replacement may briefly start instead of extending the same
+process.
+
+The lease state and lock must be on storage shared by the submit host and Slurm
+jobs (normally the user's shared home filesystem). Recommended settings are a
+5-second heartbeat and a 30-second TTL. Persistent children that are finishing
+their idle tail remain accounted for in launcher demand so they cannot hide
+capacity needed by another app.
 
 ## Install
 
