@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import signal
 import subprocess
@@ -77,6 +78,26 @@ def _config(root: Path, apps: tuple[PoolAppProfile, ...]) -> PoolConfig:
         memory_mb=6000,
         auto_pull=False,
     )
+
+
+def _synthetic_ready_quarantine(
+    lock_path: Path,
+    *,
+    action: str,
+    token: str,
+) -> tuple[Path, tuple[int, int]]:
+    label = "released" if action == "release" else "stale"
+    pending = lock_path.with_name(f".{lock_path.name}.{label}.{token}.pending")
+    pending.mkdir()
+    metadata = pending.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    ready = pool_module._ready_warm_lock_quarantine_path(
+        lock_path,
+        action=action,
+        token=token,
+    )
+    pending.rename(ready)
+    return ready, identity
 
 
 class SharedWorkerPoolTests(unittest.TestCase):
@@ -438,6 +459,376 @@ class SharedWorkerPoolTests(unittest.TestCase):
 
             pool_module._release_warm_lease_lock(replacement)
             pool_module._remove_recovered_warm_lock(moved)
+
+    def test_transient_nfs_enotempty_after_release_does_not_fail_claim(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = replace(
+                _config(root, (app,)),
+                warm_lease_cleanup_timeout_seconds=0.1,
+            )
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+            real_rmdir = pool_module.os.rmdir
+            release_attempts = 0
+
+            def transient_enotempty(path: object, *args: object, **kwargs: object) -> None:
+                nonlocal release_attempts
+                if ".released." in Path(path).name:
+                    release_attempts += 1
+                    if release_attempts == 1:
+                        raise OSError(errno.ENOTEMPTY, "simulated delayed NFS directory entry")
+                real_rmdir(path, *args, **kwargs)
+
+            with patch.object(pool_module.os, "rmdir", side_effect=transient_enotempty):
+                self.assertEqual(
+                    claim_persistent_warm_app(config, [need], worker_id="worker-a", now=1000),
+                    app,
+                )
+
+            self.assertGreaterEqual(release_attempts, 2)
+            self.assertFalse(pool_module.warm_lease_lock_path(config).exists())
+            self.assertEqual(list(root.glob(".warm_leases.json.lock.d.released.*")), [])
+            state = json.loads((root / "warm_leases.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["leases"][0]["worker_id"], "worker-a")
+
+    def test_persistent_nfs_enotempty_does_not_fail_claim_or_heartbeat(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = replace(
+                _config(root, (app,)),
+                warm_lease_cleanup_timeout_seconds=0.0,
+                warm_lease_cleanup_defer_seconds=0.0,
+            )
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+            real_rmdir = pool_module.os.rmdir
+
+            def persistent_enotempty(path: object, *args: object, **kwargs: object) -> None:
+                if ".released." in Path(path).name:
+                    raise OSError(errno.ENOTEMPTY, "simulated persistent NFS directory entry")
+                real_rmdir(path, *args, **kwargs)
+
+            with patch.object(
+                pool_module.os,
+                "rmdir",
+                side_effect=persistent_enotempty,
+            ), patch.object(
+                pool_module,
+                "launcher_log",
+                side_effect=BrokenPipeError("simulated unavailable Slurm output stream"),
+            ):
+                self.assertEqual(
+                    claim_persistent_warm_app(config, [need], worker_id="worker-a", now=1000),
+                    app,
+                )
+                self.assertTrue(
+                    heartbeat_persistent_warm_lease(
+                        config,
+                        app_name=app.name,
+                        worker_id="worker-a",
+                        now=1001,
+                    )
+                )
+                self.assertEqual(
+                    [lease["worker_id"] for lease in active_persistent_warm_leases(config, now=1001)],
+                    ["worker-a"],
+                )
+
+            self.assertFalse(pool_module.warm_lease_lock_path(config).exists())
+            quarantines = list(root.glob(".warm_leases.json.lock.d.released.*"))
+            self.assertGreaterEqual(len(quarantines), 3)
+            state = json.loads((root / "warm_leases.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["leases"][0]["heartbeat_at"], 1001)
+
+            pool_module._cleanup_old_warm_lock_quarantines(config)
+            self.assertEqual(list(root.glob(".warm_leases.json.lock.d.released.*")), [])
+
+    def test_post_detach_cleanup_and_log_exceptions_do_not_mask_claim(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (app,))
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+
+            with patch.object(
+                pool_module,
+                "_remove_recovered_warm_lock",
+                side_effect=RuntimeError("simulated cleanup defect"),
+            ), patch.object(
+                pool_module,
+                "launcher_log",
+                side_effect=BrokenPipeError("simulated unavailable Slurm output stream"),
+            ):
+                self.assertEqual(
+                    claim_persistent_warm_app(config, [need], worker_id="worker-a", now=1000),
+                    app,
+                )
+
+            state = json.loads((root / "warm_leases.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["leases"][0]["worker_id"], "worker-a")
+            self.assertFalse(pool_module.warm_lease_lock_path(config).exists())
+
+    def test_nfs_silly_rename_and_unknown_entries_are_deferred_safely(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = replace(
+                _config(root, ()),
+                warm_lease_cleanup_defer_seconds=0.0,
+            )
+            lock_path = pool_module.warm_lease_lock_path(config)
+            nfs_quarantine, identity = _synthetic_ready_quarantine(
+                lock_path,
+                action="release",
+                token="a" * 32,
+            )
+            nfs_entry = nfs_quarantine / ".nfs12345678"
+            nfs_entry.write_text("still open remotely", encoding="utf-8")
+
+            self.assertFalse(
+                pool_module._remove_recovered_warm_lock(
+                    nfs_quarantine,
+                    expected_identity=identity,
+                    timeout_seconds=0.0,
+                )
+            )
+            self.assertTrue(nfs_entry.exists())
+            nfs_entry.unlink()
+            pool_module._cleanup_old_warm_lock_quarantines(config)
+            self.assertFalse(nfs_quarantine.exists())
+
+            unknown_quarantine, _identity = _synthetic_ready_quarantine(
+                lock_path,
+                action="release",
+                token="b" * 32,
+            )
+            unknown = unknown_quarantine / "unexpected"
+            unknown.write_text("preserve me", encoding="utf-8")
+            pool_module._cleanup_old_warm_lock_quarantines(config)
+            self.assertEqual(unknown.read_text(encoding="utf-8"), "preserve me")
+
+            malformed_quarantine = lock_path.with_name(f".{lock_path.name}.released.not-a-uuid")
+            malformed_quarantine.mkdir()
+            pool_module._cleanup_old_warm_lock_quarantines(config)
+            self.assertTrue(malformed_quarantine.is_dir())
+
+            crowded_quarantine, crowded_identity = _synthetic_ready_quarantine(
+                lock_path,
+                action="release",
+                token="d" * 32,
+            )
+            for index in range(pool_module.WARM_LOCK_QUARANTINE_ENTRY_LIMIT + 1):
+                (crowded_quarantine / f".nfs{index:08d}").write_text("busy", encoding="utf-8")
+            self.assertFalse(
+                pool_module._remove_recovered_warm_lock(
+                    crowded_quarantine,
+                    expected_identity=crowded_identity,
+                    timeout_seconds=0.0,
+                )
+            )
+            self.assertEqual(
+                len(list(crowded_quarantine.iterdir())),
+                pool_module.WARM_LOCK_QUARANTINE_ENTRY_LIMIT + 1,
+            )
+
+    def test_quarantine_cleanup_refuses_observed_replacement_and_symlink(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root, ())
+            lock_path = pool_module.warm_lease_lock_path(config)
+            quarantine, original_identity = _synthetic_ready_quarantine(
+                lock_path,
+                action="release",
+                token="c" * 32,
+            )
+            moved = root / "detached-original"
+            quarantine.rename(moved)
+            quarantine.mkdir()
+            replacement_owner = quarantine / "owner.json"
+            replacement_owner.write_text("replacement", encoding="utf-8")
+
+            self.assertFalse(
+                pool_module._remove_recovered_warm_lock(
+                    quarantine,
+                    expected_identity=original_identity,
+                    timeout_seconds=0.0,
+                )
+            )
+            self.assertEqual(replacement_owner.read_text(encoding="utf-8"), "replacement")
+
+            quarantine.rename(root / "replacement-directory")
+            target = root / "symlink-target"
+            target.mkdir()
+            target_owner = target / "owner.json"
+            target_owner.write_text("target", encoding="utf-8")
+            quarantine.symlink_to(target, target_is_directory=True)
+            self.assertFalse(
+                pool_module._remove_recovered_warm_lock(
+                    quarantine,
+                    expected_identity=original_identity,
+                    timeout_seconds=0.0,
+                )
+            )
+            self.assertEqual(target_owner.read_text(encoding="utf-8"), "target")
+            pool_module._cleanup_old_warm_lock_quarantines(replace(config, warm_lease_cleanup_defer_seconds=0))
+            self.assertEqual(target_owner.read_text(encoding="utf-8"), "target")
+
+    def test_sweeper_cannot_remove_quarantine_before_release_verification(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = replace(
+                _config(root, ()),
+                warm_lease_cleanup_defer_seconds=0.0,
+            )
+            ownership = pool_module._acquire_warm_lease_lock(config)
+            rename_completed = threading.Event()
+            allow_rename_to_return = threading.Event()
+            release_errors: list[BaseException] = []
+            real_rename = pool_module.os.rename
+
+            def controlled_rename(source: object, destination: object) -> None:
+                if Path(source) == ownership.path and threading.current_thread().name == "paused-release":
+                    real_rename(source, destination)
+                    rename_completed.set()
+                    if not allow_rename_to_return.wait(timeout=2):
+                        raise TimeoutError("test did not resume release")
+                    return
+                real_rename(source, destination)
+
+            def release() -> None:
+                try:
+                    pool_module._release_warm_lease_lock(ownership)
+                except BaseException as exc:
+                    release_errors.append(exc)
+
+            with patch.object(pool_module.os, "rename", side_effect=controlled_rename):
+                thread = threading.Thread(target=release, name="paused-release")
+                thread.start()
+                try:
+                    self.assertTrue(rename_completed.wait(timeout=2))
+                    pending = list(root.glob(".warm_leases.json.lock.d.released.*.pending"))
+                    self.assertEqual(len(pending), 1)
+                    pool_module._cleanup_old_warm_lock_quarantines(config)
+                    self.assertTrue(pending[0].is_dir())
+                    self.assertTrue((pending[0] / "owner.json").is_file())
+                finally:
+                    allow_rename_to_return.set()
+                    thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(release_errors, [])
+            self.assertEqual(list(root.glob(".warm_leases.json.lock.d.released.*")), [])
+
+    def test_stale_recovery_cleanup_enotempty_still_acquires_replacement(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = replace(
+                _config(root, ()),
+                warm_lease_lock_timeout_seconds=0.5,
+                warm_lease_lock_stale_seconds=0.1,
+                warm_lease_cleanup_timeout_seconds=0.0,
+            )
+            old = pool_module._acquire_warm_lease_lock(config)
+            owner_path = old.path / "owner.json"
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+            stale_at = time.time() - 1
+            owner["created_at"] = stale_at
+            owner_path.write_text(json.dumps(owner), encoding="utf-8")
+            pool_module.os.utime(owner_path, (stale_at, stale_at))
+            pool_module.os.utime(old.path, (stale_at, stale_at))
+            real_rmdir = pool_module.os.rmdir
+
+            def stale_enotempty(path: object, *args: object, **kwargs: object) -> None:
+                if ".stale." in Path(path).name:
+                    raise OSError(errno.ENOTEMPTY, "simulated delayed NFS directory entry")
+                real_rmdir(path, *args, **kwargs)
+
+            with patch.object(pool_module.os, "rmdir", side_effect=stale_enotempty):
+                replacement = pool_module._acquire_warm_lease_lock(config)
+
+            self.assertTrue(replacement.path.is_dir())
+            self.assertNotEqual((replacement.device, replacement.inode), (old.device, old.inode))
+            pool_module._release_warm_lease_lock(old)
+            pool_module._release_warm_lease_lock(replacement)
+
+    def test_pre_detach_release_failure_remains_strict_and_does_not_mask_callback(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root, ())
+
+            with patch.object(
+                pool_module.os,
+                "rename",
+                side_effect=OSError(errno.EIO, "simulated pre-detach failure"),
+            ):
+                with self.assertRaisesRegex(WarmLeaseStateError, "cannot release"):
+                    pool_module._with_warm_lease_lock(config, lambda: "committed")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root, ())
+
+            def fail_callback() -> None:
+                raise RuntimeError("primary callback failure")
+
+            with patch.object(
+                pool_module.os,
+                "rename",
+                side_effect=OSError(errno.EIO, "simulated secondary release failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "primary callback failure") as raised:
+                    pool_module._with_warm_lease_lock(config, fail_callback)
+            self.assertTrue(
+                any("release also failed" in note for note in getattr(raised.exception, "__notes__", []))
+            )
 
     def test_stale_recovery_transition_pins_inode_against_owner_release(self) -> None:
         with TemporaryDirectory() as tmp:

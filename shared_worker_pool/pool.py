@@ -35,11 +35,16 @@ from shared_worker_pool.runtime import (
 )
 
 
-POOL_LAUNCHER_VERSION = "shared-worker-pool-20260830-nfs-warm-lock"
-POOL_WORKER_VERSION = "shared-worker-pool-worker-20260830-nfs-warm-lock"
+POOL_LAUNCHER_VERSION = "shared-worker-pool-20260830-nfs-warm-cleanup"
+POOL_WORKER_VERSION = "shared-worker-pool-worker-20260830-nfs-warm-cleanup"
 WARM_LEASE_STATE_VERSION = 1
 WARM_LOCK_OWNER_VERSION = 1
 MAX_WARM_LEASE_STATE_BYTES = 1024 * 1024
+WARM_LOCK_CLEANUP_RETRY_SECONDS = 0.02
+WARM_LOCK_QUARANTINE_ENTRY_LIMIT = 8
+WARM_LOCK_QUARANTINE_SCAN_LIMIT = 64
+WARM_LOCK_QUARANTINE_SWEEP_LIMIT = 8
+WARM_LOCK_QUARANTINE_SWEEP_SECONDS = 0.05
 
 
 class WarmLeaseError(RuntimeError):
@@ -117,6 +122,8 @@ class PoolConfig:
     warm_lease_lock_timeout_seconds: float = 2.0
     warm_lease_lock_stale_seconds: float = 30.0
     warm_lease_max_heartbeat_failures: int = 3
+    warm_lease_cleanup_timeout_seconds: float = 0.25
+    warm_lease_cleanup_defer_seconds: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -213,10 +220,16 @@ def load_pool_config(path: Path) -> PoolConfig:
     )
     warm_lease_lock_timeout_seconds = float(pool.get("warm_lease_lock_timeout_seconds") or 2.0)
     warm_lease_lock_stale_seconds = float(pool.get("warm_lease_lock_stale_seconds") or 30.0)
+    warm_lease_cleanup_timeout_seconds = float(pool.get("warm_lease_cleanup_timeout_seconds", 0.25))
+    warm_lease_cleanup_defer_seconds = float(pool.get("warm_lease_cleanup_defer_seconds", 1.0))
     if not math.isfinite(warm_lease_lock_timeout_seconds) or warm_lease_lock_timeout_seconds <= 0:
         raise ValueError("warm_lease_lock_timeout_seconds must be finite and positive")
     if not math.isfinite(warm_lease_lock_stale_seconds) or warm_lease_lock_stale_seconds <= 0:
         raise ValueError("warm_lease_lock_stale_seconds must be finite and positive")
+    if not math.isfinite(warm_lease_cleanup_timeout_seconds) or warm_lease_cleanup_timeout_seconds < 0:
+        raise ValueError("warm_lease_cleanup_timeout_seconds must be finite and nonnegative")
+    if not math.isfinite(warm_lease_cleanup_defer_seconds) or warm_lease_cleanup_defer_seconds < 0:
+        raise ValueError("warm_lease_cleanup_defer_seconds must be finite and nonnegative")
     warm_lease_lock_stale_seconds = max(
         warm_lease_lock_stale_seconds,
         warm_lease_lock_timeout_seconds * 3.0,
@@ -286,6 +299,8 @@ def load_pool_config(path: Path) -> PoolConfig:
             1,
             int(pool.get("warm_lease_max_heartbeat_failures") or 3),
         ),
+        warm_lease_cleanup_timeout_seconds=warm_lease_cleanup_timeout_seconds,
+        warm_lease_cleanup_defer_seconds=warm_lease_cleanup_defer_seconds,
     )
 
 
@@ -950,25 +965,343 @@ def _claim_warm_lock_transition(
     raise WarmLeaseStateError(f"persistent warm lock {lock_path} changed too often during transition election")
 
 
-def _remove_recovered_warm_lock(path: Path) -> None:
+def _expected_warm_lock_cleanup_entry(name: str) -> bool:
+    if name == "owner.json":
+        return True
     try:
-        entries = list(path.iterdir())
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise WarmLeaseStateError(f"cannot inspect recovered persistent warm lock {path}: {exc}") from exc
-    for entry in entries:
-        try:
-            metadata = entry.lstat()
-        except FileNotFoundError:
+        return _warm_transition_index(name) is not None
+    except WarmLeaseStateError:
+        return False
+
+
+def _warm_coordination_diagnostic(message: str) -> None:
+    """Report noncritical coordination cleanup without creating a failure path."""
+
+    try:
+        launcher_log(message)
+    except Exception:
+        # stdout may itself be an unavailable Slurm/NFS-backed stream. Once a
+        # lock inode is detached, even diagnostics must not undo the logical
+        # success of the completed coordination transaction.
+        pass
+
+
+def _warm_lock_ready_quarantine(
+    lock_path: Path,
+    name: str,
+) -> str | None:
+    actions = {
+        f".{lock_path.name}.released.": "release",
+        f".{lock_path.name}.stale.": "recover",
+    }
+    for prefix, action in actions.items():
+        if not name.startswith(prefix):
             continue
-        if (
-            (entry.name != "owner.json" and _warm_transition_index(entry.name) is None)
-            or not stat.S_ISREG(metadata.st_mode)
-        ):
-            raise WarmLeaseStateError(f"recovered persistent warm lock {path} contains unexpected entries")
-        entry.unlink()
-    path.rmdir()
+        suffix = name[len(prefix) :]
+        parts = suffix.split(".")
+        if len(parts) != 2 or parts[1] != "ready":
+            return None
+        token, _ready = parts
+        if len(token) != 32 or not all(character in "0123456789abcdef" for character in token):
+            return None
+        return action
+    return None
+
+
+def _ready_warm_lock_quarantine_path(
+    lock_path: Path,
+    *,
+    action: str,
+    token: str,
+) -> Path:
+    label = "released" if action == "release" else "stale"
+    return lock_path.with_name(f".{lock_path.name}.{label}.{token}.ready")
+
+
+def _path_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return (-1, -1)
+    if not stat.S_ISDIR(metadata.st_mode):
+        return (-1, -1)
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _remove_recovered_warm_lock(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    timeout_seconds: float = 0.0,
+    log_deferred: bool = True,
+) -> bool:
+    """Best-effort cleanup after the canonical lock was safely detached.
+
+    NFS can transiently return ENOTEMPTY for an apparently empty directory, or
+    create a temporary `.nfs*` file when an unlinked record still has a remote
+    open reference. Neither condition affects mutual exclusion once the lock
+    inode has been renamed away from the canonical path. Retry for a bounded
+    interval, then leave the quarantine for a later sweep without converting a
+    successful lease transaction into a coordination failure.
+    """
+
+    if not path.name.endswith(".ready"):
+        if log_deferred:
+            _warm_coordination_diagnostic(
+                f"persistent warm lock quarantine {path} has no GC-readiness handshake; "
+                "leaving it untouched"
+            )
+        return False
+
+    if expected_identity is None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if log_deferred:
+                _warm_coordination_diagnostic(
+                    f"deferred persistent warm lock cleanup for {path}: "
+                    f"cannot inspect directory: {type(exc).__name__}: {exc}"
+                )
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            if log_deferred:
+                _warm_coordination_diagnostic(
+                    f"persistent warm lock quarantine {path} is no longer the expected directory; "
+                    "leaving it untouched"
+                )
+            return False
+        expected_identity = (metadata.st_dev, metadata.st_ino)
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    last_problem = "NFS directory state did not settle"
+    while True:
+        retry = False
+        current_identity = _path_identity(path)
+        if current_identity is None:
+            return True
+        if current_identity != expected_identity:
+            if log_deferred:
+                _warm_coordination_diagnostic(
+                    f"persistent warm lock quarantine {path} changed identity; leaving its replacement untouched"
+                )
+            return False
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        directory_fd: int | None = None
+        try:
+            directory_fd = os.open(path, flags)
+            opened = os.fstat(directory_fd)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            last_problem = f"cannot open directory: {type(exc).__name__}: {exc}"
+            retry = True
+        else:
+            if (opened.st_dev, opened.st_ino) != expected_identity:
+                os.close(directory_fd)
+                if log_deferred:
+                    _warm_coordination_diagnostic(
+                        f"persistent warm lock quarantine {path} changed while opening; "
+                        "leaving its replacement untouched"
+                    )
+                return False
+            entries: list[str] = []
+            too_many_entries = False
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    for entry in iterator:
+                        if len(entries) >= WARM_LOCK_QUARANTINE_ENTRY_LIMIT:
+                            too_many_entries = True
+                            break
+                        entries.append(entry.name)
+            except OSError as exc:
+                last_problem = f"cannot list directory: {type(exc).__name__}: {exc}"
+                retry = True
+                entries = []
+            if too_many_entries:
+                os.close(directory_fd)
+                if log_deferred:
+                    _warm_coordination_diagnostic(
+                        f"persistent warm lock quarantine {path} has more than "
+                        f"{WARM_LOCK_QUARANTINE_ENTRY_LIMIT} entries; leaving it untouched"
+                    )
+                return False
+
+            removable_entries: list[str] = []
+            unexpected_entry: str | None = None
+            for name in entries:
+                try:
+                    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    last_problem = f"cannot inspect {name}: {type(exc).__name__}: {exc}"
+                    retry = True
+                    continue
+                if name.startswith(".nfs") and stat.S_ISREG(metadata.st_mode):
+                    last_problem = f"waiting for transient NFS entry {name}"
+                    retry = True
+                    continue
+                if not _expected_warm_lock_cleanup_entry(name) or not stat.S_ISREG(metadata.st_mode):
+                    unexpected_entry = name
+                    break
+                removable_entries.append(name)
+            if unexpected_entry is not None:
+                os.close(directory_fd)
+                if log_deferred:
+                    _warm_coordination_diagnostic(
+                        f"persistent warm lock quarantine {path} has unexpected entry "
+                        f"{unexpected_entry!r}; leaving it untouched"
+                    )
+                return False
+
+            for name in removable_entries:
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    last_problem = f"cannot unlink {name}: {type(exc).__name__}: {exc}"
+                    retry = True
+
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError as exc:
+                last_problem = f"cannot close directory: {type(exc).__name__}: {exc}"
+                retry = True
+
+        if not retry:
+            # rmdir is path-based, so revalidate the detached name immediately
+            # before using it. All content access above is pinned to the opened
+            # inode and cannot follow a swapped symlink or touch a replacement.
+            current_identity = _path_identity(path)
+            if current_identity is None:
+                return True
+            if current_identity != expected_identity:
+                if log_deferred:
+                    _warm_coordination_diagnostic(
+                        f"persistent warm lock quarantine {path} changed before removal; "
+                        "leaving its replacement untouched"
+                    )
+                return False
+            try:
+                path.rmdir()
+            except FileNotFoundError:
+                return True
+            except OSError as exc:
+                # In particular, NFS may report ENOTEMPTY even when the listing
+                # above was empty. A subsequent pass or later acquisition can
+                # remove the already-detached quarantine safely.
+                last_problem = f"cannot remove directory: {type(exc).__name__}: {exc}"
+            else:
+                return True
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if log_deferred:
+                _warm_coordination_diagnostic(
+                    f"deferred persistent warm lock cleanup for {path}: {last_problem}"
+                )
+            return False
+        time.sleep(min(WARM_LOCK_CLEANUP_RETRY_SECONDS, remaining))
+
+
+def _cleanup_old_warm_lock_quarantines(config: PoolConfig) -> None:
+    """Best-effort bounded sweep of settled detached lock quarantines."""
+
+    lock_path = warm_lease_lock_path(config)
+    checked_at = time.time()
+    deadline = time.monotonic() + WARM_LOCK_QUARANTINE_SWEEP_SECONDS
+    candidates: list[tuple[float, Path, tuple[int, int]]] = []
+    scanned = 0
+    try:
+        children = os.scandir(lock_path.parent)
+    except OSError as exc:
+        _warm_coordination_diagnostic(
+            f"could not inspect persistent warm lock quarantines under {lock_path.parent}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+    with children:
+        for child in children:
+            if time.monotonic() >= deadline or scanned >= WARM_LOCK_QUARANTINE_SCAN_LIMIT:
+                break
+            scanned += 1
+            if _warm_lock_ready_quarantine(lock_path, child.name) is None:
+                continue
+            try:
+                metadata = child.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(metadata.st_mode):
+                continue
+            if checked_at - float(metadata.st_mtime) < config.warm_lease_cleanup_defer_seconds:
+                continue
+            # st_dev is client-local for NFS mounts. Capture and use the
+            # sweeper's own identity only; never encode/compare the creator's
+            # device number across the submit host and Ada workers.
+            candidates.append(
+                (
+                    float(metadata.st_mtime),
+                    Path(child.path),
+                    (metadata.st_dev, metadata.st_ino),
+                )
+            )
+    for _modified_at, candidate, expected_identity in sorted(candidates)[
+        :WARM_LOCK_QUARANTINE_SWEEP_LIMIT
+    ]:
+        if time.monotonic() >= deadline:
+            break
+        _remove_recovered_warm_lock(
+            candidate,
+            expected_identity=expected_identity,
+            timeout_seconds=0.0,
+            log_deferred=False,
+        )
+
+
+def _finish_warm_lock_quarantine_cleanup(
+    config: PoolConfig,
+    quarantine: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Keep all post-detach garbage collection outside the critical path."""
+
+    removed = False
+    try:
+        removed = _remove_recovered_warm_lock(
+            quarantine,
+            expected_identity=expected_identity,
+            timeout_seconds=config.warm_lease_cleanup_timeout_seconds,
+        )
+    except Exception as exc:
+        # The verified rename above is the unlock linearization point. This is
+        # deliberately broad so a cleanup defect cannot report a committed
+        # state update as failed or mask the callback's own exception.
+        _warm_coordination_diagnostic(
+            f"deferred persistent warm lock cleanup for {quarantine}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if removed:
+        return
+    try:
+        _cleanup_old_warm_lock_quarantines(config)
+    except Exception as exc:
+        _warm_coordination_diagnostic(
+            f"deferred persistent warm lock quarantine sweep under {quarantine.parent}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _recover_stale_warm_lock(config: PoolConfig, lock_path: Path, *, now: float) -> bool:
@@ -996,7 +1329,8 @@ def _recover_stale_warm_lock(config: PoolConfig, lock_path: Path, *, now: float)
     if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
         os.close(directory_fd)
         return True
-    quarantine: Path | None = None
+    quarantine_token = uuid.uuid4().hex
+    pending_quarantine: Path | None = None
     try:
         newest_timestamp = float(metadata.st_mtime)
         try:
@@ -1049,22 +1383,51 @@ def _recover_stale_warm_lock(config: PoolConfig, lock_path: Path, *, now: float)
         if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
             return True
 
-        quarantine = lock_path.with_name(f".{lock_path.name}.stale.{uuid.uuid4().hex}")
+        pending_quarantine = lock_path.with_name(
+            f".{lock_path.name}.stale.{quarantine_token}.pending"
+        )
         try:
             # The inode-tied transition prevents any cooperating releaser or
             # reclaimer from renaming this path between the check and rename.
-            os.rename(lock_path, quarantine)
+            os.rename(lock_path, pending_quarantine)
         except FileNotFoundError:
             return True
         except OSError as exc:
             raise WarmLeaseStateError(f"cannot recover stale persistent warm lock {lock_path}: {exc}") from exc
     finally:
-        os.close(directory_fd)
-    assert quarantine is not None
-    moved = quarantine.lstat()
+        try:
+            os.close(directory_fd)
+        except OSError as exc:
+            _warm_coordination_diagnostic(
+                f"could not close persistent warm lock descriptor for {lock_path}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    assert pending_quarantine is not None
+    moved = pending_quarantine.lstat()
     if (moved.st_dev, moved.st_ino) != (metadata.st_dev, metadata.st_ino):
         raise WarmLeaseStateError(f"persistent warm lock {lock_path} changed during stale recovery")
-    _remove_recovered_warm_lock(quarantine)
+    quarantine = _ready_warm_lock_quarantine_path(
+        lock_path,
+        action="recover",
+        token=quarantine_token,
+    )
+    try:
+        # This second rename is the GC-readiness handshake. Sweepers do not
+        # recognize the pending name, so they cannot race the strict moved-
+        # inode verification above. Failure leaves a harmless unsweepable
+        # pending quarantine and cannot undo the canonical detach.
+        os.rename(pending_quarantine, quarantine)
+    except OSError as exc:
+        _warm_coordination_diagnostic(
+            f"deferred persistent warm lock cleanup for {pending_quarantine}: "
+            f"could not publish GC readiness: {type(exc).__name__}: {exc}"
+        )
+        return True
+    _finish_warm_lock_quarantine_cleanup(
+        config,
+        quarantine,
+        expected_identity=(moved.st_dev, moved.st_ino),
+    )
     return True
 
 
@@ -1165,7 +1528,8 @@ def _acquire_warm_lease_lock(config: PoolConfig) -> _WarmLeaseLockOwnership:
 
 
 def _release_warm_lease_lock(ownership: _WarmLeaseLockOwnership) -> None:
-    quarantine: Path | None = None
+    quarantine_token = uuid.uuid4().hex
+    pending_quarantine: Path | None = None
     try:
         metadata = os.fstat(ownership.directory_fd)
         if (metadata.st_dev, metadata.st_ino) != (ownership.device, ownership.inode):
@@ -1191,17 +1555,42 @@ def _release_warm_lease_lock(ownership: _WarmLeaseLockOwnership) -> None:
             return
         if (current.st_dev, current.st_ino) != (ownership.device, ownership.inode):
             return
-        quarantine = ownership.path.with_name(f".{ownership.path.name}.released.{uuid.uuid4().hex}")
-        os.rename(ownership.path, quarantine)
-        moved = quarantine.lstat()
+        pending_quarantine = ownership.path.with_name(
+            f".{ownership.path.name}.released.{quarantine_token}.pending"
+        )
+        os.rename(ownership.path, pending_quarantine)
+        moved = pending_quarantine.lstat()
         if (moved.st_dev, moved.st_ino) != (ownership.device, ownership.inode):
             raise WarmLeaseStateError(f"persistent warm lock {ownership.path} changed during release")
     except OSError as exc:
         raise WarmLeaseStateError(f"cannot release persistent warm lock {ownership.path}: {exc}") from exc
     finally:
-        os.close(ownership.directory_fd)
-    if quarantine is not None:
-        _remove_recovered_warm_lock(quarantine)
+        try:
+            os.close(ownership.directory_fd)
+        except OSError as exc:
+            _warm_coordination_diagnostic(
+                f"could not close persistent warm lock descriptor for {ownership.path}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    if pending_quarantine is not None:
+        quarantine = _ready_warm_lock_quarantine_path(
+            ownership.path,
+            action="release",
+            token=quarantine_token,
+        )
+        try:
+            os.rename(pending_quarantine, quarantine)
+        except OSError as exc:
+            _warm_coordination_diagnostic(
+                f"deferred persistent warm lock cleanup for {pending_quarantine}: "
+                f"could not publish GC readiness: {type(exc).__name__}: {exc}"
+            )
+        else:
+            _finish_warm_lock_quarantine_cleanup(
+                ownership.config,
+                quarantine,
+                expected_identity=(ownership.device, ownership.inode),
+            )
 
 
 def _with_warm_lease_lock(config: PoolConfig, callback: Any) -> Any:
@@ -1211,15 +1600,34 @@ def _with_warm_lease_lock(config: PoolConfig, callback: Any) -> Any:
         raise
     except OSError as exc:
         raise WarmLeaseStateError(f"cannot acquire persistent warm coordination lock: {exc}") from exc
-    try:
-        return callback()
-    finally:
+    def release() -> None:
         try:
             _release_warm_lease_lock(ownership)
         except WarmLeaseError:
             raise
         except OSError as exc:
             raise WarmLeaseStateError(f"cannot release persistent warm coordination lock: {exc}") from exc
+
+    try:
+        result = callback()
+    except BaseException as callback_error:
+        try:
+            release()
+        except Exception as release_error:
+            # Preserve the operation's primary failure. The release failure is
+            # still visible to operators and on the original exception without
+            # replacing the reason the callback failed.
+            callback_error.add_note(
+                "persistent warm lock release also failed: "
+                f"{type(release_error).__name__}: {release_error}"
+            )
+            _warm_coordination_diagnostic(
+                "persistent warm lock release failed while preserving callback error: "
+                f"{type(release_error).__name__}: {release_error}"
+            )
+        raise
+    release()
+    return result
 
 
 def claim_persistent_warm_app(
@@ -1382,6 +1790,8 @@ def pool_worker_config_version(config: PoolConfig) -> str:
         "warm_lease_lock_timeout_seconds": config.warm_lease_lock_timeout_seconds,
         "warm_lease_lock_stale_seconds": config.warm_lease_lock_stale_seconds,
         "warm_lease_max_heartbeat_failures": config.warm_lease_max_heartbeat_failures,
+        "warm_lease_cleanup_timeout_seconds": config.warm_lease_cleanup_timeout_seconds,
+        "warm_lease_cleanup_defer_seconds": config.warm_lease_cleanup_defer_seconds,
         "apps": [
             {
                 "name": app.name,

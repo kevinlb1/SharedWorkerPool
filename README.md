@@ -58,6 +58,38 @@ not automatically superseded because portable NFS operations cannot safely
 fence the paused actor; that rare case remains failed closed for an operator to
 inspect after confirming no launcher or worker still owns it.
 
+The verified rename of that exact lock inode to a unique detached quarantine is
+the unlock commit point. The first detached name ends in `.pending` and is
+never eligible for automatic cleanup. Only after the releaser verifies the
+moved inode does it rename the directory to an exact
+`.ready` name. This second rename is a garbage-collection readiness handshake,
+so a paused releaser cannot race a sweeper before its strict verification
+completes.
+
+Removing a ready detached directory is garbage collection, not coordination:
+NFS may briefly leave a `.nfs*` file for an open unlinked record or report
+`ENOTEMPTY` for an apparently empty directory. Cleanup retries for at most
+`warm_lease_cleanup_timeout_seconds` (0.25 seconds by default), then leaves the
+quarantine without failing the completed claim, heartbeat, read, or release. A
+deferred cleanup also sweeps a small bounded set of exact UUID-named ready
+quarantines older than `warm_lease_cleanup_defer_seconds` (1 second by default),
+while successful operations avoid an extra shared-directory scan. Cleanup pins
+and rechecks the expected directory inode, refuses symlinks and unexpected
+entries, never unlinks `.nfs*`, and never examines the canonical lock path. A
+sweeper captures that inode identity on its own NFS client; it never compares a
+creator's client-local device number across hosts. Ready names are random and
+never reused by cooperating processes. Portable NFS has no conditional
+`rmdir`-by-inode, so adversarial same-account path replacement during the final
+identity-check window is outside this trusted staging topology. Cleanup
+diagnostics are best effort so a broken Slurm output stream cannot turn garbage
+collection back into a transaction failure.
+
+Release quarantines made by package 0.2.1 do not carry the readiness handshake
+and are intentionally ignored by automatic cleanup. After all 0.2.1 actors are
+gone, an operator may remove only those legacy directories independently
+verified to be empty; an unmarked nonempty directory remains evidence to
+inspect rather than time-fenced garbage.
+
 Leases older than `warm_lease_ttl_seconds` are recoverable after a dead Slurm
 job, and the lease limit is additionally capped by the control plane's current
 `warmPool.requestedWorkers`. A fresh lease owned by an older worker version is
