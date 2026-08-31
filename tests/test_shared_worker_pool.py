@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,11 +13,14 @@ import unittest
 from unittest.mock import Mock, patch
 
 from shared_worker_pool import runtime as runtime_module
+from shared_worker_pool import pool as pool_module
 from shared_worker_pool import (
     AppNeed,
     PoolAppProfile,
     PoolConfig,
     PoolScaleState,
+    WarmLeaseLockTimeout,
+    WarmLeaseStateError,
     active_persistent_warm_leases,
     app_need_from_status,
     candidate_apps,
@@ -28,6 +35,8 @@ from shared_worker_pool import (
     pool_worker_should_retire,
     resource_admission,
     release_persistent_warm_lease,
+    read_dispatch_state_needs,
+    read_dispatch_state_payload,
     write_dispatch_state,
 )
 from shared_worker_pool.pool import (
@@ -206,6 +215,7 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 running_units=0,
                 worker_capacity=4,
                 warm_requested_workers=1,
+                warm_request_expires_at=2000,
             ),
         ]
 
@@ -216,6 +226,7 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 min_idle_workers=0,
                 max_jobs=400,
                 max_submit_per_cycle=100,
+                now=1000,
             ),
             1,
         )
@@ -228,6 +239,7 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 running_units=4,
                 worker_capacity=4,
                 warm_requested_workers=1,
+                warm_request_expires_at=2000,
             ),
         ]
 
@@ -238,6 +250,7 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 min_idle_workers=0,
                 max_jobs=400,
                 max_submit_per_cycle=100,
+                now=1000,
             ),
             1,
         )
@@ -314,6 +327,285 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 now=1042,
             )
             self.assertEqual(active_persistent_warm_leases(config, now=1042), [])
+
+    def test_concurrent_persistent_warm_claims_select_exactly_one_worker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (app,))
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+            barrier = threading.Barrier(12)
+
+            def claim(index: int) -> str | None:
+                barrier.wait(timeout=2)
+                claimed = claim_persistent_warm_app(
+                    config,
+                    [need],
+                    worker_id=f"worker-{index}",
+                    now=1000,
+                )
+                return claimed.name if claimed else None
+
+            with ThreadPoolExecutor(max_workers=12) as executor:
+                results = list(executor.map(claim, range(12)))
+
+            self.assertEqual(results.count(app.name), 1)
+            self.assertEqual(len(active_persistent_warm_leases(config, now=1000)), 1)
+
+    def test_persistent_warm_lock_is_nfs_safe_bounded_and_recovers_stale_owner(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = replace(
+                _config(root, (app,)),
+                warm_lease_lock_timeout_seconds=0.01,
+                warm_lease_lock_stale_seconds=30,
+            )
+            ownership = pool_module._acquire_warm_lease_lock(config)
+            with self.assertRaises(WarmLeaseLockTimeout):
+                pool_module._acquire_warm_lease_lock(config)
+            pool_module._release_warm_lease_lock(ownership)
+
+            lock_path = pool_module.warm_lease_lock_path(config)
+            lock_path.mkdir(mode=0o700)
+            owner_path = lock_path / "owner.json"
+            stale_at = time.time() - 120
+            owner_path.write_text(
+                json.dumps(
+                    {
+                        "version": pool_module.WARM_LOCK_OWNER_VERSION,
+                        "token": "dead-owner",
+                        "created_at": stale_at,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            owner_path.touch()
+            pool_module.os.utime(owner_path, (stale_at, stale_at))
+            pool_module.os.utime(lock_path, (stale_at, stale_at))
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=time.time() + 60,
+            )
+            with patch("shared_worker_pool.pool.fcntl.flock", side_effect=OSError(37, "No locks available")) as flock:
+                self.assertEqual(claim_persistent_warm_app(config, [need], worker_id="worker-a"), app)
+            flock.assert_not_called()
+
+    def test_old_lock_owner_cannot_release_replacement(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root, ())
+            old = pool_module._acquire_warm_lease_lock(config)
+            moved = root / "old-lock"
+            old.path.rename(moved)
+            replacement = pool_module._acquire_warm_lease_lock(config)
+
+            pool_module._release_warm_lease_lock(old)
+            self.assertTrue(replacement.path.is_dir())
+            self.assertEqual(
+                json.loads((replacement.path / "owner.json").read_text(encoding="utf-8"))["token"],
+                replacement.token,
+            )
+
+            pool_module._release_warm_lease_lock(replacement)
+            pool_module._remove_recovered_warm_lock(moved)
+
+    def test_stale_recovery_transition_pins_inode_against_owner_release(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = replace(
+                _config(root, ()),
+                warm_lease_lock_timeout_seconds=0.5,
+                warm_lease_lock_stale_seconds=0.1,
+            )
+            ownership = pool_module._acquire_warm_lease_lock(config)
+            owner_path = ownership.path / "owner.json"
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+            stale_at = time.time() - 1
+            owner["created_at"] = stale_at
+            owner_path.write_text(json.dumps(owner), encoding="utf-8")
+            pool_module.os.utime(owner_path, (stale_at, stale_at))
+            pool_module.os.utime(ownership.path, (stale_at, stale_at))
+
+            rename_entered = threading.Event()
+            allow_rename = threading.Event()
+            recovery_errors: list[BaseException] = []
+            real_rename = pool_module.os.rename
+
+            def controlled_rename(source: object, destination: object) -> None:
+                if Path(source) == ownership.path and threading.current_thread().name == "stale-recovery":
+                    rename_entered.set()
+                    if not allow_rename.wait(timeout=2):
+                        raise TimeoutError("test did not release stale recovery")
+                real_rename(source, destination)
+
+            def recover() -> None:
+                try:
+                    pool_module._recover_stale_warm_lock(config, ownership.path, now=time.time())
+                except BaseException as exc:
+                    recovery_errors.append(exc)
+
+            with patch.object(pool_module.os, "rename", side_effect=controlled_rename):
+                thread = threading.Thread(target=recover, name="stale-recovery")
+                thread.start()
+                self.assertTrue(rename_entered.wait(timeout=2))
+                # Recovery owns the inode-tied transition, so the old owner
+                # cannot remove or rename a replacement while releasing.
+                pool_module._release_warm_lease_lock(ownership)
+                allow_rename.set()
+                thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(recovery_errors, [])
+            replacement = pool_module._acquire_warm_lease_lock(config)
+            self.assertTrue(replacement.path.is_dir())
+            pool_module._release_warm_lease_lock(replacement)
+
+    def test_malformed_wrong_version_and_io_lease_state_fail_closed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (app,))
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+            state_path = pool_module.warm_lease_state_path(config)
+            for contents in (
+                "{not-json",
+                json.dumps({"version": 999, "updated_at": 1000, "leases": []}),
+                json.dumps(
+                    {
+                        "version": pool_module.WARM_LEASE_STATE_VERSION,
+                        "updated_at": 1000,
+                        "leases": [{"app": app.name, "worker_id": "worker-a", "heartbeat_at": "bad"}],
+                    }
+                ),
+            ):
+                state_path.write_text(contents, encoding="utf-8")
+                with self.assertRaises(WarmLeaseStateError):
+                    claim_persistent_warm_app(config, [need], worker_id="worker-new", now=1000)
+                self.assertEqual(state_path.read_text(encoding="utf-8"), contents)
+
+            state_path.unlink()
+            with patch.object(pool_module.os, "open", side_effect=OSError("simulated I/O failure")):
+                with self.assertRaises(WarmLeaseStateError):
+                    claim_persistent_warm_app(config, [need], worker_id="worker-new", now=1000)
+
+    def test_missing_lease_heartbeat_does_not_exceed_app_limit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (app,))
+            need = AppNeed(
+                name=app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+            self.assertIsNotNone(claim_persistent_warm_app(config, [need], worker_id="worker-b", now=1000))
+            self.assertFalse(
+                heartbeat_persistent_warm_lease(
+                    config,
+                    app_name=app.name,
+                    worker_id="worker-a",
+                    now=1001,
+                )
+            )
+            self.assertEqual(
+                [lease["worker_id"] for lease in active_persistent_warm_leases(config, now=1001)],
+                ["worker-b"],
+            )
+
+    def test_missing_lease_heartbeat_rejects_worker_owned_by_another_app(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apps = tuple(
+                PoolAppProfile(
+                    name=name,
+                    control_url=f"https://example.test/{name}",
+                    token_file=root / f"{name}-token",
+                    source_dir=root,
+                    python="python3",
+                    worker_module=f"{name}.worker",
+                    status_mode="codingworkspace",
+                    persistent_warm_workers=1,
+                )
+                for name in ("app-a", "app-b")
+            )
+            config = _config(root, apps)
+            need = AppNeed(
+                name="app-a",
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=2000,
+            )
+            self.assertIsNotNone(claim_persistent_warm_app(config, [need], worker_id="worker-a", now=1000))
+            self.assertFalse(
+                heartbeat_persistent_warm_lease(
+                    config,
+                    app_name="app-b",
+                    worker_id="worker-a",
+                    now=1001,
+                )
+            )
+            leases = active_persistent_warm_leases(config, now=1001)
+            self.assertEqual([(lease["app"], lease["worker_id"]) for lease in leases], [("app-a", "worker-a")])
 
     def test_persistent_warm_lease_refuses_expired_or_draining_request(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -486,6 +778,117 @@ class SharedWorkerPoolTests(unittest.TestCase):
             heartbeat.assert_called_once_with(config, app_name=app.name, worker_id="worker-a")
             release.assert_called_once_with(config, app_name=app.name, worker_id="worker-a")
 
+    def test_persistent_parent_gracefully_drains_once_after_heartbeat_failures(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = replace(_config(root, (app,)), warm_lease_max_heartbeat_failures=3)
+            process = Mock()
+            process.wait.side_effect = [
+                subprocess.TimeoutExpired("worker", 5),
+                subprocess.TimeoutExpired("worker", 5),
+                subprocess.TimeoutExpired("worker", 5),
+                subprocess.TimeoutExpired("worker", 5),
+                0,
+            ]
+
+            with patch("shared_worker_pool.pool.subprocess.Popen", return_value=process), patch(
+                "shared_worker_pool.pool.heartbeat_persistent_warm_lease",
+                side_effect=WarmLeaseStateError("unavailable"),
+            ) as heartbeat, patch("shared_worker_pool.pool.release_persistent_warm_lease"):
+                code = run_persistent_app_worker(
+                    config,
+                    app,
+                    pool_worker_id="worker-a",
+                    scratch_root=root / "scratch",
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(heartbeat.call_count, 3)
+            process.send_signal.assert_called_once_with(signal.SIGUSR1)
+            process.terminate.assert_not_called()
+            process.kill.assert_not_called()
+
+    def test_persistent_parent_gracefully_drains_immediately_after_lease_loss(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (app,))
+            process = Mock()
+            process.wait.side_effect = [subprocess.TimeoutExpired("worker", 5), 0]
+
+            with patch("shared_worker_pool.pool.subprocess.Popen", return_value=process), patch(
+                "shared_worker_pool.pool.heartbeat_persistent_warm_lease",
+                return_value=False,
+            ) as heartbeat, patch("shared_worker_pool.pool.release_persistent_warm_lease"):
+                code = run_persistent_app_worker(
+                    config,
+                    app,
+                    pool_worker_id="worker-a",
+                    scratch_root=root / "scratch",
+                )
+
+            self.assertEqual(code, 0)
+            heartbeat.assert_called_once_with(config, app_name=app.name, worker_id="worker-a")
+            process.send_signal.assert_called_once_with(signal.SIGUSR1)
+            process.terminate.assert_not_called()
+
+    def test_persistent_parent_retries_failed_drain_signal_without_killing_child(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (app,))
+            process = Mock()
+            process.wait.side_effect = [
+                subprocess.TimeoutExpired("worker", 5),
+                subprocess.TimeoutExpired("worker", 5),
+                0,
+            ]
+            process.send_signal.side_effect = [OSError("temporary signal failure"), None]
+
+            with patch("shared_worker_pool.pool.subprocess.Popen", return_value=process), patch(
+                "shared_worker_pool.pool.heartbeat_persistent_warm_lease",
+                return_value=False,
+            ) as heartbeat, patch("shared_worker_pool.pool.release_persistent_warm_lease"):
+                code = run_persistent_app_worker(
+                    config,
+                    app,
+                    pool_worker_id="worker-a",
+                    scratch_root=root / "scratch",
+                )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(heartbeat.call_count, 1)
+            self.assertEqual(process.send_signal.call_args_list, [unittest.mock.call(signal.SIGUSR1)] * 2)
+            process.terminate.assert_not_called()
+
     def test_persistent_parent_cleans_up_child_on_supervisor_failure(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -550,6 +953,203 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 )
                 self.assertFalse(dispatch_state_has_activity(config))
 
+    def test_expired_warm_request_is_filtered_from_submission_demand(self) -> None:
+        need = AppNeed(
+            name="codingworkspace",
+            queued_units=0,
+            running_units=0,
+            worker_capacity=1,
+            warm_requested_workers=1,
+            warm_request_expires_at=999,
+        )
+        self.assertEqual(
+            desired_pool_submissions(
+                [need],
+                live_slurm_jobs=0,
+                min_idle_workers=0,
+                max_jobs=32,
+                max_submit_per_cycle=8,
+                now=1000,
+            ),
+            0,
+        )
+
+    def test_status_requires_finite_positive_warm_seconds(self) -> None:
+        app = PoolAppProfile(
+            name="codingworkspace",
+            control_url="https://example.test/CodingWorkspace",
+            token_file=Path("/tmp/token"),
+            source_dir=Path("/tmp/cw"),
+            python="python3",
+            worker_module="codingworkspace.worker",
+            status_mode="codingworkspace",
+            persistent_warm_workers=1,
+        )
+        for seconds in (0, -1, float("nan"), float("inf"), "bad"):
+            need = app_need_from_status(
+                app,
+                {
+                    "remoteWorkersEnabled": True,
+                    "turns": {},
+                    "warmPool": {"requestedWorkers": 1, "secondsRemaining": seconds},
+                },
+            )
+            self.assertEqual(need.warm_requested_workers, 0)
+            self.assertFalse(need.warm_request_is_active())
+
+    def test_malformed_dispatch_expiry_is_rejected_without_crashing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+            )
+            config = _config(root, (app,))
+            write_dispatch_state(
+                config,
+                needs=[
+                    AppNeed(
+                        name=app.name,
+                        queued_units=0,
+                        running_units=0,
+                        worker_capacity=1,
+                        warm_requested_workers=1,
+                        warm_request_expires_at=time.time() + 60,
+                    )
+                ],
+                live_slurm_jobs=0,
+                desired_submissions=0,
+                submitted_jobs=0,
+                status="idle",
+            )
+            original = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
+            for expires_at in ("bad", float("nan"), float("inf")):
+                payload = dict(original)
+                payload["expires_at"] = expires_at
+                config.dispatch_state_path.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertIsNone(read_dispatch_state_payload(config))
+
+            original["apps"][0]["warm_request_expires_at"] = "bad"
+            config.dispatch_state_path.write_text(json.dumps(original), encoding="utf-8")
+            needs = read_dispatch_state_needs(config)
+            self.assertIsNotNone(needs)
+            assert needs is not None
+            self.assertFalse(needs[0].warm_request_is_active())
+            config.dispatch_state_path.write_bytes(b"\xff\xfe\xfd")
+            self.assertIsNone(read_dispatch_state_payload(config))
+
+    def test_launcher_counts_fresh_lease_after_persistent_app_is_removed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            warm_app = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "cw-token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                persistent_warm_workers=1,
+            )
+            old_config = _config(root, (warm_app,))
+            now = time.time()
+            warm_need = AppNeed(
+                name=warm_app.name,
+                queued_units=0,
+                running_units=0,
+                worker_capacity=1,
+                warm_requested_workers=1,
+                warm_request_expires_at=now + 60,
+            )
+            self.assertIsNotNone(
+                claim_persistent_warm_app(old_config, [warm_need], worker_id="old-worker", now=now)
+            )
+
+            caida = PoolAppProfile(
+                name="caida",
+                control_url="https://example.test/CAIDA-Concierge",
+                token_file=root / "caida-token",
+                source_dir=root,
+                python="python3",
+                worker_module="app.worker",
+                status_mode="caida",
+                worker_capacity=4,
+            )
+            new_config = _config(root, (caida,))
+            with patch(
+                "shared_worker_pool.pool.fetch_app_status",
+                return_value={
+                    "clusterWorkersEnabled": True,
+                    "jobs": {"queuedUnclaimed": 4, "runningTotal": 0},
+                },
+            ), patch("shared_worker_pool.pool.live_slurm_job_count", return_value=1):
+                count = poll_launcher_once(new_config, dry_run=True)
+
+            self.assertEqual(count, 1)
+
+            with patch(
+                "shared_worker_pool.pool.fetch_app_status",
+                return_value={
+                    "clusterWorkersEnabled": True,
+                    "jobs": {"queuedUnclaimed": 0, "runningTotal": 0},
+                },
+            ), patch("shared_worker_pool.pool.live_slurm_job_count", return_value=0):
+                self.assertEqual(poll_launcher_once(new_config, dry_run=True), 0)
+
+    def test_launcher_lease_state_failure_uses_fail_closed_tail_accounting(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caida = PoolAppProfile(
+                name="caida",
+                control_url="https://example.test/CAIDA-Concierge",
+                token_file=root / "caida-token",
+                source_dir=root,
+                python="python3",
+                worker_module="app.worker",
+                status_mode="caida",
+                worker_capacity=4,
+            )
+            codingworkspace = PoolAppProfile(
+                name="codingworkspace",
+                control_url="https://example.test/CodingWorkspace",
+                token_file=root / "cw-token",
+                source_dir=root,
+                python="python3",
+                worker_module="codingworkspace.worker",
+                status_mode="codingworkspace",
+                worker_capacity=4,
+                persistent_warm_workers=1,
+            )
+            config = _config(root, (caida, codingworkspace))
+            state_path = pool_module.warm_lease_state_path(config)
+            state_path.write_text("{malformed", encoding="utf-8")
+
+            def status(app: PoolAppProfile, *, launcher_id: str) -> dict[str, object]:
+                if app.name == "caida":
+                    return {
+                        "clusterWorkersEnabled": True,
+                        "jobs": {"queuedUnclaimed": 4, "runningTotal": 0},
+                    }
+                return {
+                    "remoteWorkersEnabled": True,
+                    "turns": {"queuedUnclaimed": 0, "runningTotal": 0},
+                    "warmPool": {"requestedWorkers": 1, "secondsRemaining": 600},
+                }
+
+            with patch("shared_worker_pool.pool.fetch_app_status", side_effect=status), patch(
+                "shared_worker_pool.pool.live_slurm_job_count",
+                return_value=1,
+            ):
+                count = poll_launcher_once(config, dry_run=True)
+
+            self.assertEqual(count, 1)
+            self.assertEqual(state_path.read_text(encoding="utf-8"), "{malformed")
+
     def test_reads_generic_app_status_modes(self) -> None:
         caida = PoolAppProfile(
             name="caida",
@@ -603,7 +1203,7 @@ class SharedWorkerPoolTests(unittest.TestCase):
                     "warmPool": {"requestedWorkers": 4, "secondsRemaining": 600},
                 },
             )
-        self.assertEqual(warm_need.target_workers, 1)
+        self.assertEqual(warm_need.target_workers_at(now=1000), 1)
         self.assertEqual(warm_need.warm_requested_workers, 1)
         self.assertEqual(warm_need.warm_request_expires_at, 1600)
 

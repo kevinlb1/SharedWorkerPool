@@ -16,10 +16,12 @@ import math
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,9 +35,23 @@ from shared_worker_pool.runtime import (
 )
 
 
-POOL_LAUNCHER_VERSION = "shared-worker-pool-20260830-persistent-warm"
-POOL_WORKER_VERSION = "shared-worker-pool-worker-20260830-persistent-warm"
+POOL_LAUNCHER_VERSION = "shared-worker-pool-20260830-nfs-warm-lock"
+POOL_WORKER_VERSION = "shared-worker-pool-worker-20260830-nfs-warm-lock"
 WARM_LEASE_STATE_VERSION = 1
+WARM_LOCK_OWNER_VERSION = 1
+MAX_WARM_LEASE_STATE_BYTES = 1024 * 1024
+
+
+class WarmLeaseError(RuntimeError):
+    """Base class for persistent-warm lease coordination failures."""
+
+
+class WarmLeaseStateError(WarmLeaseError):
+    """Raised when persistent-warm state cannot be trusted."""
+
+
+class WarmLeaseLockTimeout(WarmLeaseError):
+    """Raised when the persistent-warm lock cannot be acquired promptly."""
 
 
 @dataclass(frozen=True)
@@ -98,6 +114,9 @@ class PoolConfig:
     warm_lease_state_path: Path | None = None
     warm_lease_heartbeat_seconds: float = 5.0
     warm_lease_ttl_seconds: float = 30.0
+    warm_lease_lock_timeout_seconds: float = 2.0
+    warm_lease_lock_stale_seconds: float = 30.0
+    warm_lease_max_heartbeat_failures: int = 3
 
 
 @dataclass(frozen=True)
@@ -123,15 +142,26 @@ class AppNeed:
 
     @property
     def target_workers(self) -> int:
+        return self.target_workers_at()
+
+    def target_workers_at(self, *, now: float | None = None) -> int:
         if not self.enabled or self.restart_drain_active:
             return 0
-        return self.active_workers + max(self.needed_workers, max(0, self.warm_requested_workers))
+        return self.active_workers + max(self.needed_workers, self.effective_warm_requested_workers(now=now))
+
+    def effective_warm_requested_workers(self, *, now: float | None = None) -> int:
+        if not self.warm_request_is_active(now=now):
+            return 0
+        return max(0, self.warm_requested_workers)
 
     def warm_request_is_active(self, *, now: float | None = None) -> bool:
         if self.warm_requested_workers <= 0:
             return False
-        expires_at = max(0.0, float(self.warm_request_expires_at or 0.0))
-        return not expires_at or expires_at > (time.time() if now is None else now)
+        try:
+            expires_at = float(self.warm_request_expires_at)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(expires_at) and expires_at > (time.time() if now is None else now)
 
 
 def _expand_path(value: str | Path) -> Path:
@@ -180,6 +210,16 @@ def load_pool_config(path: Path) -> PoolConfig:
     warm_lease_ttl_seconds = max(
         warm_lease_heartbeat_seconds * 3.0,
         float(pool.get("warm_lease_ttl_seconds") or 30.0),
+    )
+    warm_lease_lock_timeout_seconds = float(pool.get("warm_lease_lock_timeout_seconds") or 2.0)
+    warm_lease_lock_stale_seconds = float(pool.get("warm_lease_lock_stale_seconds") or 30.0)
+    if not math.isfinite(warm_lease_lock_timeout_seconds) or warm_lease_lock_timeout_seconds <= 0:
+        raise ValueError("warm_lease_lock_timeout_seconds must be finite and positive")
+    if not math.isfinite(warm_lease_lock_stale_seconds) or warm_lease_lock_stale_seconds <= 0:
+        raise ValueError("warm_lease_lock_stale_seconds must be finite and positive")
+    warm_lease_lock_stale_seconds = max(
+        warm_lease_lock_stale_seconds,
+        warm_lease_lock_timeout_seconds * 3.0,
     )
     return PoolConfig(
         config_path=path.resolve(),
@@ -240,6 +280,12 @@ def load_pool_config(path: Path) -> PoolConfig:
         ),
         warm_lease_heartbeat_seconds=warm_lease_heartbeat_seconds,
         warm_lease_ttl_seconds=warm_lease_ttl_seconds,
+        warm_lease_lock_timeout_seconds=warm_lease_lock_timeout_seconds,
+        warm_lease_lock_stale_seconds=warm_lease_lock_stale_seconds,
+        warm_lease_max_heartbeat_failures=max(
+            1,
+            int(pool.get("warm_lease_max_heartbeat_failures") or 3),
+        ),
     )
 
 
@@ -348,14 +394,20 @@ def fetch_app_status(app: PoolAppProfile, *, launcher_id: str) -> dict[str, Any]
 def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed:
     mode = app.status_mode
     warm_pool = status.get("warmPool") if isinstance(status.get("warmPool"), dict) else {}
-    warm_requested_workers = max(0, int(warm_pool.get("requestedWorkers") or 0))
+    try:
+        warm_requested_workers = max(0, int(warm_pool.get("requestedWorkers") or 0))
+    except (TypeError, ValueError, OverflowError):
+        warm_requested_workers = 0
     if app.persistent_warm_workers:
         warm_requested_workers = min(warm_requested_workers, app.persistent_warm_workers)
     try:
-        warm_seconds_remaining = max(0.0, float(warm_pool.get("secondsRemaining") or 0.0))
+        warm_seconds_remaining = float(warm_pool.get("secondsRemaining") or 0.0)
     except (TypeError, ValueError):
         warm_seconds_remaining = 0.0
-    warm_request_expires_at = time.time() + warm_seconds_remaining if warm_seconds_remaining else 0.0
+    if not math.isfinite(warm_seconds_remaining) or warm_seconds_remaining <= 0:
+        warm_requested_workers = 0
+        warm_seconds_remaining = 0.0
+    warm_request_expires_at = time.time() + warm_seconds_remaining if warm_requested_workers else 0.0
     if mode == "caida":
         jobs = status.get("jobs") if isinstance(status.get("jobs"), dict) else {}
         enabled = bool(status.get("clusterWorkersEnabled") or status.get("remoteWorkersEnabled"))
@@ -394,9 +446,11 @@ def desired_pool_submissions(
     app_start_burst_workers: int = 0,
     app_start_burst_overcommit: int = 0,
     persistent_warm_tail_workers: int = 0,
+    now: float | None = None,
 ) -> int:
+    checked_at = time.time() if now is None else float(now)
     active_needs = [need for need in needs if need.enabled and not need.restart_drain_active]
-    needed_workers = sum(need.target_workers for need in active_needs)
+    needed_workers = sum(need.target_workers_at(now=checked_at) for need in active_needs)
     needed_workers += max(0, int(persistent_warm_tail_workers or 0))
     if any(need.queued_units or need.running_units for need in active_needs):
         needed_workers += max(0, int(min_idle_workers or 0))
@@ -439,6 +493,12 @@ def app_need_to_payload(need: AppNeed) -> dict[str, Any]:
 
 
 def app_need_from_payload(payload: dict[str, Any]) -> AppNeed:
+    try:
+        warm_request_expires_at = float(payload.get("warm_request_expires_at") or 0.0)
+    except (TypeError, ValueError):
+        warm_request_expires_at = 0.0
+    if not math.isfinite(warm_request_expires_at) or warm_request_expires_at <= 0:
+        warm_request_expires_at = 0.0
     return AppNeed(
         name=str(payload.get("name") or ""),
         queued_units=max(0, int(payload.get("queued_units") or 0)),
@@ -447,7 +507,7 @@ def app_need_from_payload(payload: dict[str, Any]) -> AppNeed:
         enabled=bool(payload.get("enabled", True)),
         restart_drain_active=bool(payload.get("restart_drain_active")),
         warm_requested_workers=max(0, int(payload.get("warm_requested_workers") or 0)),
-        warm_request_expires_at=max(0.0, float(payload.get("warm_request_expires_at") or 0.0)),
+        warm_request_expires_at=warm_request_expires_at,
     )
 
 
@@ -525,13 +585,15 @@ def write_dispatch_state(
 def read_dispatch_state_payload(config: PoolConfig, *, allow_stale: bool = False) -> dict[str, Any] | None:
     try:
         raw = json.loads(config.dispatch_state_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError, OSError):
         return None
     if not isinstance(raw, dict):
         return None
     try:
         expires_at = float(raw.get("expires_at") or 0.0)
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(expires_at):
         return None
     if not allow_stale and expires_at < time.time():
         return None
@@ -548,7 +610,10 @@ def read_dispatch_state_needs(config: PoolConfig, *, allow_stale: bool = False) 
     needs: list[AppNeed] = []
     for item in apps:
         if isinstance(item, dict):
-            need = app_need_from_payload(item)
+            try:
+                need = app_need_from_payload(item)
+            except (TypeError, ValueError, OverflowError):
+                return None
             if need.name:
                 needs.append(need)
     return needs
@@ -573,20 +638,113 @@ def warm_lease_state_path(config: PoolConfig) -> Path:
 
 def warm_lease_lock_path(config: PoolConfig) -> Path:
     path = warm_lease_state_path(config)
-    return path.with_suffix(path.suffix + ".lock")
+    # A directory created with mkdir(2) is an atomic exclusion primitive on NFS.
+    # Keep this distinct from the legacy flock file so a rolling upgrade cannot
+    # mistake the old regular file for a corrupt directory lock.
+    return path.with_suffix(path.suffix + ".lock.d")
+
+
+@dataclass(frozen=True)
+class _WarmLeaseLockOwnership:
+    config: PoolConfig
+    path: Path
+    token: str
+    device: int
+    inode: int
+    directory_fd: int
+
+
+def _warm_state_error(path: Path, message: str, exc: BaseException | None = None) -> WarmLeaseStateError:
+    error = WarmLeaseStateError(f"persistent warm lease state {path}: {message}")
+    if exc is not None:
+        error.__cause__ = exc
+    return error
 
 
 def _read_warm_leases_unlocked(config: PoolConfig) -> list[dict[str, Any]]:
+    path = warm_lease_state_path(config)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        payload = json.loads(warm_lease_state_path(config).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
         return []
-    if not isinstance(payload, dict) or payload.get("version") != WARM_LEASE_STATE_VERSION:
-        return []
+    except OSError as exc:
+        raise _warm_state_error(path, f"cannot open it ({exc})", exc)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _warm_state_error(path, "is not a regular file")
+        if metadata.st_size > MAX_WARM_LEASE_STATE_BYTES:
+            raise _warm_state_error(path, f"exceeds {MAX_WARM_LEASE_STATE_BYTES} bytes")
+        chunks: list[bytes] = []
+        remaining = MAX_WARM_LEASE_STATE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_WARM_LEASE_STATE_BYTES:
+            raise _warm_state_error(path, f"exceeds {MAX_WARM_LEASE_STATE_BYTES} bytes")
+    except OSError as exc:
+        raise _warm_state_error(path, f"cannot read it ({exc})", exc)
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _warm_state_error(path, "contains malformed JSON", exc)
+    if not isinstance(payload, dict):
+        raise _warm_state_error(path, "must contain a JSON object")
+    version = payload.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != WARM_LEASE_STATE_VERSION:
+        raise _warm_state_error(
+            path,
+            f"has unsupported version {version!r}; expected {WARM_LEASE_STATE_VERSION}",
+        )
+    updated_at = payload.get("updated_at")
+    if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)) or not math.isfinite(float(updated_at)):
+        raise _warm_state_error(path, "has an invalid updated_at value")
     leases = payload.get("leases")
     if not isinstance(leases, list):
-        return []
-    return [dict(item) for item in leases if isinstance(item, dict)]
+        raise _warm_state_error(path, "has a non-list leases value")
+    normalized: list[dict[str, Any]] = []
+    seen_workers: set[str] = set()
+    for index, item in enumerate(leases):
+        if not isinstance(item, dict):
+            raise _warm_state_error(path, f"lease {index} is not an object")
+        app_name = item.get("app")
+        worker_id = item.get("worker_id")
+        if not isinstance(app_name, str) or not app_name.strip():
+            raise _warm_state_error(path, f"lease {index} has an invalid app")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise _warm_state_error(path, f"lease {index} has an invalid worker_id")
+        app_name = app_name.strip()
+        worker_id = worker_id.strip()
+        if worker_id in seen_workers:
+            raise _warm_state_error(path, f"contains duplicate worker_id {worker_id!r}")
+        heartbeat_at = item.get("heartbeat_at")
+        if (
+            isinstance(heartbeat_at, bool)
+            or not isinstance(heartbeat_at, (int, float))
+            or not math.isfinite(float(heartbeat_at))
+        ):
+            raise _warm_state_error(path, f"lease {index} has an invalid heartbeat_at")
+        copied = dict(item)
+        copied["app"] = app_name
+        copied["worker_id"] = worker_id
+        copied["heartbeat_at"] = float(heartbeat_at)
+        for field_name in ("claimed_at", "request_expires_at"):
+            if field_name not in copied:
+                continue
+            value = copied[field_name]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise _warm_state_error(path, f"lease {index} has an invalid {field_name}")
+            copied[field_name] = float(value)
+        normalized.append(copied)
+        seen_workers.add(worker_id)
+    return normalized
 
 
 def _current_warm_leases_unlocked(
@@ -595,27 +753,13 @@ def _current_warm_leases_unlocked(
     now: float,
 ) -> list[dict[str, Any]]:
     current: list[dict[str, Any]] = []
-    seen_workers: set[str] = set()
     for lease in _read_warm_leases_unlocked(config):
-        app_name = str(lease.get("app") or "").strip()
-        worker_id = str(lease.get("worker_id") or "").strip()
-        try:
-            heartbeat_at = float(lease.get("heartbeat_at") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if not app_name or not worker_id or worker_id in seen_workers:
-            continue
-        if not math.isfinite(heartbeat_at):
-            continue
+        heartbeat_at = float(lease["heartbeat_at"])
         if heartbeat_at < now - config.warm_lease_ttl_seconds:
             continue
         if heartbeat_at > now + config.warm_lease_ttl_seconds:
             continue
-        lease["app"] = app_name
-        lease["worker_id"] = worker_id
-        lease["heartbeat_at"] = heartbeat_at
         current.append(lease)
-        seen_workers.add(worker_id)
     return current
 
 
@@ -627,31 +771,455 @@ def _write_warm_leases_unlocked(
 ) -> None:
     path = warm_lease_state_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
-        json.dumps(
-            {
-                "version": WARM_LEASE_STATE_VERSION,
-                "updated_at": now,
-                "leases": leases,
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise _warm_state_error(path, f"cannot inspect it before writing ({exc})", exc)
+    else:
+        if not stat.S_ISREG(existing.st_mode):
+            raise _warm_state_error(path, "refuses to replace a non-regular file")
+    encoded = json.dumps(
+        {
+            "version": WARM_LEASE_STATE_VERSION,
+            "updated_at": now,
+            "leases": leases,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(encoded) > MAX_WARM_LEASE_STATE_BYTES:
+        raise _warm_state_error(path, f"would exceed {MAX_WARM_LEASE_STATE_BYTES} bytes")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        _write_all(descriptor, encoded)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise _warm_state_error(path, f"cannot update it ({exc})", exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("short write while updating persistent warm coordination state")
+        offset += written
+
+
+def _read_warm_lock_owner_fd(directory_fd: int, lock_path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    owner_path = lock_path / "owner.json"
+    try:
+        descriptor = os.open("owner.json", flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} is unreadable or malformed") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 16384:
+            raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} is not a valid regular file")
+        data = os.read(descriptor, 16385)
+        if len(data) > 16384:
+            raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} is too large")
+    except OSError as exc:
+        raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} is unreadable or malformed") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} is unreadable or malformed") from exc
+    if (
+        not isinstance(payload, dict)
+        or isinstance(payload.get("version"), bool)
+        or payload.get("version") != WARM_LOCK_OWNER_VERSION
+    ):
+        raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} has an unsupported version")
+    token = payload.get("token")
+    created_at = payload.get("created_at")
+    if not isinstance(token, str) or not token:
+        raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} has an invalid token")
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not math.isfinite(float(created_at))
+    ):
+        raise WarmLeaseStateError(f"persistent warm lock owner {owner_path} has an invalid timestamp")
+    return payload
+
+
+def _write_warm_lock_record_fd(directory_fd: int, name: str, payload: dict[str, Any]) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
     )
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        _write_all(descriptor, json.dumps(payload, sort_keys=True).encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _warm_transition_index(name: str) -> int | None:
+    prefix = "transition."
+    suffix = ".json"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    value = name[len(prefix) : -len(suffix)]
+    if not value.isdigit():
+        raise WarmLeaseStateError(f"persistent warm lock has malformed transition record {name!r}")
+    return int(value)
+
+
+def _claim_warm_lock_transition(
+    config: PoolConfig,
+    directory_fd: int,
+    lock_path: Path,
+    *,
+    action: str,
+    now: float,
+) -> str | None:
+    """Elect one release/recovery actor inside the observed lock inode.
+
+    The transition record pins the directory so its winner can rename exactly
+    that inode. We deliberately never supersede a transition automatically: a
+    paused older actor cannot be fenced from a newer actor with portable NFS
+    operations, and unsafe takeover could rename a replacement lock (ABA). A
+    crashed transition therefore fails closed and requires operator cleanup.
+    """
+
+    for _attempt in range(8):
+        try:
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            raise WarmLeaseStateError(f"cannot inspect persistent warm lock {lock_path}: {exc}") from exc
+        transitions: list[tuple[int, str]] = []
+        for name in names:
+            index = _warm_transition_index(name)
+            if index is not None:
+                transitions.append((index, name))
+        if transitions:
+            for _index, transition_name in transitions:
+                try:
+                    metadata = os.stat(transition_name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise WarmLeaseStateError(
+                        f"cannot inspect persistent warm lock transition {lock_path / transition_name}: {exc}"
+                    ) from exc
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise WarmLeaseStateError(
+                        f"persistent warm lock transition {lock_path / transition_name} is not a regular file"
+                    )
+            return None
+        name = "transition.00000000000000000000.json"
+        try:
+            _write_warm_lock_record_fd(
+                directory_fd,
+                name,
+                {
+                    "version": WARM_LOCK_OWNER_VERSION,
+                    "token": uuid.uuid4().hex,
+                    "action": action,
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "created_at": now,
+                },
+            )
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise WarmLeaseStateError(f"cannot claim persistent warm lock transition {lock_path}: {exc}") from exc
+        return name
+    raise WarmLeaseStateError(f"persistent warm lock {lock_path} changed too often during transition election")
+
+
+def _remove_recovered_warm_lock(path: Path) -> None:
+    try:
+        entries = list(path.iterdir())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise WarmLeaseStateError(f"cannot inspect recovered persistent warm lock {path}: {exc}") from exc
+    for entry in entries:
+        try:
+            metadata = entry.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            (entry.name != "owner.json" and _warm_transition_index(entry.name) is None)
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise WarmLeaseStateError(f"recovered persistent warm lock {path} contains unexpected entries")
+        entry.unlink()
+    path.rmdir()
+
+
+def _recover_stale_warm_lock(config: PoolConfig, lock_path: Path, *, now: float) -> bool:
+    directory_fd: int | None = None
+    try:
+        metadata = lock_path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        raise WarmLeaseStateError(f"cannot inspect persistent warm lock {lock_path}: {exc}") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise WarmLeaseStateError(f"persistent warm lock {lock_path} is not a directory")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_fd = os.open(lock_path, flags)
+        opened = os.fstat(directory_fd)
+    except FileNotFoundError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        return True
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise WarmLeaseStateError(f"cannot open persistent warm lock {lock_path}: {exc}") from exc
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        os.close(directory_fd)
+        return True
+    quarantine: Path | None = None
+    try:
+        newest_timestamp = float(metadata.st_mtime)
+        try:
+            owner = _read_warm_lock_owner_fd(directory_fd, lock_path)
+        except WarmLeaseStateError:
+            try:
+                owner_metadata = os.stat("owner.json", dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                pass
+            else:
+                newest_timestamp = max(newest_timestamp, float(owner_metadata.st_mtime))
+        else:
+            newest_timestamp = max(newest_timestamp, float(owner["created_at"]))
+        if now - newest_timestamp < config.warm_lease_lock_stale_seconds:
+            return False
+
+        transition = _claim_warm_lock_transition(
+            config,
+            directory_fd,
+            lock_path,
+            action="recover",
+            now=now,
+        )
+        if transition is None:
+            return False
+
+        # The original owner may have been paused between mkdir and writing its
+        # record. Once this transition pins the inode, re-read the owner. A
+        # newly written owner cancels recovery; it will either continue under
+        # the still-canonical inode or observe this transition and abort.
+        try:
+            refreshed_owner = _read_warm_lock_owner_fd(directory_fd, lock_path)
+        except WarmLeaseStateError:
+            refreshed_owner = None
+        if refreshed_owner is not None and time.time() - float(refreshed_owner["created_at"]) < (
+            config.warm_lease_lock_stale_seconds
+        ):
+            try:
+                os.unlink(transition, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            return False
+
+        try:
+            current = lock_path.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise WarmLeaseStateError(f"cannot recheck persistent warm lock {lock_path}: {exc}") from exc
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            return True
+
+        quarantine = lock_path.with_name(f".{lock_path.name}.stale.{uuid.uuid4().hex}")
+        try:
+            # The inode-tied transition prevents any cooperating releaser or
+            # reclaimer from renaming this path between the check and rename.
+            os.rename(lock_path, quarantine)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise WarmLeaseStateError(f"cannot recover stale persistent warm lock {lock_path}: {exc}") from exc
+    finally:
+        os.close(directory_fd)
+    assert quarantine is not None
+    moved = quarantine.lstat()
+    if (moved.st_dev, moved.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise WarmLeaseStateError(f"persistent warm lock {lock_path} changed during stale recovery")
+    _remove_recovered_warm_lock(quarantine)
+    return True
+
+
+def _acquire_warm_lease_lock(config: PoolConfig) -> _WarmLeaseLockOwnership:
+    lock_path = warm_lease_lock_path(config)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + config.warm_lease_lock_timeout_seconds
+    token = uuid.uuid4().hex
+    first_attempt = True
+    while True:
+        if not first_attempt and time.monotonic() >= deadline:
+            raise WarmLeaseLockTimeout(
+                f"timed out after {config.warm_lease_lock_timeout_seconds:g}s acquiring {lock_path}"
+            )
+        first_attempt = False
+        try:
+            os.mkdir(lock_path, 0o700)
+        except FileExistsError:
+            if _recover_stale_warm_lock(config, lock_path, now=time.time()):
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WarmLeaseLockTimeout(
+                    f"timed out after {config.warm_lease_lock_timeout_seconds:g}s acquiring {lock_path}"
+                )
+            time.sleep(min(0.05, remaining))
+            continue
+        except OSError as exc:
+            raise WarmLeaseStateError(f"cannot create persistent warm lock {lock_path}: {exc}") from exc
+
+        directory_fd: int | None = None
+        try:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            directory_fd = os.open(lock_path, flags)
+            metadata = os.fstat(directory_fd)
+            _write_warm_lock_record_fd(
+                directory_fd,
+                "owner.json",
+                {
+                    "version": WARM_LOCK_OWNER_VERSION,
+                    "token": token,
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "created_at": time.time(),
+                },
+            )
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise WarmLeaseStateError(
+                    f"persistent warm lock {lock_path} moved while its owner record was created"
+                )
+            transitions = [
+                name
+                for name in os.listdir(directory_fd)
+                if _warm_transition_index(name) is not None
+            ]
+            if transitions:
+                raise WarmLeaseStateError(
+                    f"persistent warm lock {lock_path} entered recovery while its owner record was created"
+                )
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise WarmLeaseStateError(
+                    f"persistent warm lock {lock_path} moved while acquisition completed"
+                )
+        except BaseException:
+            try:
+                if directory_fd is not None:
+                    os.unlink("owner.json", dir_fd=directory_fd)
+            except OSError:
+                pass
+            try:
+                current = lock_path.lstat()
+                if directory_fd is not None and (current.st_dev, current.st_ino) == (
+                    os.fstat(directory_fd).st_dev,
+                    os.fstat(directory_fd).st_ino,
+                ):
+                    lock_path.rmdir()
+            except OSError:
+                pass
+            if directory_fd is not None:
+                os.close(directory_fd)
+            raise
+        assert directory_fd is not None
+        return _WarmLeaseLockOwnership(
+            config=config,
+            path=lock_path,
+            token=token,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            directory_fd=directory_fd,
+        )
+
+
+def _release_warm_lease_lock(ownership: _WarmLeaseLockOwnership) -> None:
+    quarantine: Path | None = None
+    try:
+        metadata = os.fstat(ownership.directory_fd)
+        if (metadata.st_dev, metadata.st_ino) != (ownership.device, ownership.inode):
+            return
+        try:
+            owner = _read_warm_lock_owner_fd(ownership.directory_fd, ownership.path)
+        except WarmLeaseStateError:
+            return
+        if owner["token"] != ownership.token:
+            return
+        transition = _claim_warm_lock_transition(
+            ownership.config,
+            ownership.directory_fd,
+            ownership.path,
+            action="release",
+            now=time.time(),
+        )
+        if transition is None:
+            return
+        try:
+            current = ownership.path.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) != (ownership.device, ownership.inode):
+            return
+        quarantine = ownership.path.with_name(f".{ownership.path.name}.released.{uuid.uuid4().hex}")
+        os.rename(ownership.path, quarantine)
+        moved = quarantine.lstat()
+        if (moved.st_dev, moved.st_ino) != (ownership.device, ownership.inode):
+            raise WarmLeaseStateError(f"persistent warm lock {ownership.path} changed during release")
+    except OSError as exc:
+        raise WarmLeaseStateError(f"cannot release persistent warm lock {ownership.path}: {exc}") from exc
+    finally:
+        os.close(ownership.directory_fd)
+    if quarantine is not None:
+        _remove_recovered_warm_lock(quarantine)
 
 
 def _with_warm_lease_lock(config: PoolConfig, callback: Any) -> Any:
-    lock_path = warm_lease_lock_path(config)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    try:
+        ownership = _acquire_warm_lease_lock(config)
+    except WarmLeaseError:
+        raise
+    except OSError as exc:
+        raise WarmLeaseStateError(f"cannot acquire persistent warm coordination lock: {exc}") from exc
+    try:
+        return callback()
+    finally:
         try:
-            return callback()
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _release_warm_lease_lock(ownership)
+        except WarmLeaseError:
+            raise
+        except OSError as exc:
+            raise WarmLeaseStateError(f"cannot release persistent warm coordination lock: {exc}") from exc
 
 
 def claim_persistent_warm_app(
@@ -674,7 +1242,10 @@ def claim_persistent_warm_app(
             continue
         if not need.warm_request_is_active(now=checked_at):
             continue
-        limit = min(app.persistent_warm_workers, max(0, need.warm_requested_workers))
+        limit = min(
+            app.persistent_warm_workers,
+            need.effective_warm_requested_workers(now=checked_at),
+        )
         if limit > 0:
             eligible.append((app, need, limit))
     if not eligible:
@@ -740,7 +1311,10 @@ def heartbeat_persistent_warm_lease(
             None,
         )
         if app is None:
-            _write_warm_leases_unlocked(config, leases, now=checked_at)
+            return False
+        if any(lease["worker_id"] == worker_id for lease in leases):
+            return False
+        if sum(1 for lease in leases if lease["app"] == app_name) >= app.persistent_warm_workers:
             return False
         leases.append(
             {
@@ -805,6 +1379,9 @@ def pool_worker_config_version(config: PoolConfig) -> str:
         "warm_lease_state_path": str(warm_lease_state_path(config)),
         "warm_lease_heartbeat_seconds": config.warm_lease_heartbeat_seconds,
         "warm_lease_ttl_seconds": config.warm_lease_ttl_seconds,
+        "warm_lease_lock_timeout_seconds": config.warm_lease_lock_timeout_seconds,
+        "warm_lease_lock_stale_seconds": config.warm_lease_lock_stale_seconds,
+        "warm_lease_max_heartbeat_failures": config.warm_lease_max_heartbeat_failures,
         "apps": [
             {
                 "name": app.name,
@@ -990,19 +1567,26 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
     else:
         effective_max_jobs = config.max_jobs
         effective_max_submit_per_cycle = config.max_submit_per_cycle
+    checked_at = time.time()
     persistent_warm_leases: list[dict[str, Any]] = []
-    if any(app.enabled and app.persistent_warm_workers > 0 for app in config.apps):
-        try:
-            persistent_warm_leases = active_persistent_warm_leases(config)
-        except Exception as exc:
-            launcher_log(f"shared launcher could not read persistent warm leases: {type(exc).__name__}: {exc}")
+    lease_state_failed = False
+    try:
+        # Read unconditionally: a fresh child from an older config remains a
+        # live Slurm job even if persistence was disabled or its app was removed.
+        persistent_warm_leases = active_persistent_warm_leases(config, now=checked_at)
+    except Exception as exc:
+        lease_state_failed = True
+        launcher_log(f"shared launcher could not read persistent warm leases: {type(exc).__name__}: {exc}")
     persistent_app_limits = {
         app.name: app.persistent_warm_workers
         for app in config.apps
         if app.enabled and app.persistent_warm_workers > 0
     }
     current_persistent_requests = {
-        need.name: min(persistent_app_limits.get(need.name, 0), max(0, need.warm_requested_workers))
+        need.name: min(
+            persistent_app_limits.get(need.name, 0),
+            need.effective_warm_requested_workers(now=checked_at),
+        )
         for need in needs
         if need.enabled and not need.restart_drain_active
     }
@@ -1014,9 +1598,28 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
         min(lease_count, current_persistent_requests.get(app_name, 0))
         for app_name, lease_count in persistent_lease_counts.items()
     )
-    persistent_warm_tail_workers = max(0, len(persistent_warm_leases) - matched_persistent_workers)
+    persistent_warm_tail_workers = min(
+        max(0, live_jobs),
+        max(0, len(persistent_warm_leases) - matched_persistent_workers),
+    )
+    submission_needs = needs
+    if lease_state_failed:
+        # Fail closed: do not submit new capacity solely for an uncoordinated
+        # persistent request. Reserve plausible *existing* live slots as tail so
+        # an unknown warm child cannot hide another app's ordinary demand.
+        persistent_names = set(persistent_app_limits)
+        submission_needs = [
+            replace(need, warm_requested_workers=0, warm_request_expires_at=0.0)
+            if need.name in persistent_names
+            else need
+            for need in needs
+        ]
+        possible_old_workers = sum(persistent_app_limits.values())
+        if os.path.lexists(warm_lease_state_path(config)):
+            possible_old_workers = max(1, possible_old_workers)
+        persistent_warm_tail_workers = min(max(0, live_jobs), possible_old_workers)
     count = desired_pool_submissions(
-        needs,
+        submission_needs,
         live_slurm_jobs=live_jobs,
         min_idle_workers=config.min_idle_workers,
         max_jobs=effective_max_jobs,
@@ -1024,12 +1627,14 @@ def poll_launcher_once(config: PoolConfig, *, dry_run: bool = False, scale: Pool
         app_start_burst_workers=config.app_start_burst_workers,
         app_start_burst_overcommit=config.app_start_burst_overcommit,
         persistent_warm_tail_workers=persistent_warm_tail_workers,
+        now=checked_at,
     )
     need_text = ", ".join(
         (
             f"{need.name}:queued={need.queued_units}:running={need.running_units}:"
             f"cap={need.worker_capacity}:active_workers={need.active_workers}:"
-            f"needed={need.needed_workers}:warm={need.warm_requested_workers}:target={need.target_workers}"
+            f"needed={need.needed_workers}:warm={need.effective_warm_requested_workers(now=checked_at)}:"
+            f"target={need.target_workers_at(now=checked_at)}"
         )
         for need in needs
     )
@@ -1304,27 +1909,61 @@ def run_persistent_app_worker(
     process: subprocess.Popen[Any] | None = None
     try:
         process = subprocess.Popen(command, cwd=app.source_dir, env=env)
-        lease_loss_logged = False
+        heartbeat_failures = 0
+        drain_requested = False
+        pending_drain_reason = ""
+        drain_signal_failures = 0
         while True:
             try:
                 return int(process.wait(timeout=config.warm_lease_heartbeat_seconds) or 0)
             except subprocess.TimeoutExpired:
-                try:
-                    maintained = heartbeat_persistent_warm_lease(
-                        config,
-                        app_name=app.name,
-                        worker_id=pool_worker_id,
-                    )
-                except Exception as exc:
-                    launcher_log(
-                        f"pool worker {pool_worker_id} could not heartbeat its persistent {app.name} lease: {exc}"
-                    )
+                if drain_requested:
                     continue
-                if not maintained and not lease_loss_logged:
-                    lease_loss_logged = True
-                    launcher_log(
-                        f"pool worker {pool_worker_id} lost its persistent {app.name} lease; child will finish normally"
-                    )
+                drain_reason = pending_drain_reason
+                if not drain_reason:
+                    try:
+                        maintained = heartbeat_persistent_warm_lease(
+                            config,
+                            app_name=app.name,
+                            worker_id=pool_worker_id,
+                        )
+                    except Exception as exc:
+                        heartbeat_failures += 1
+                        launcher_log(
+                            f"pool worker {pool_worker_id} could not heartbeat its persistent {app.name} lease "
+                            f"({heartbeat_failures}/{config.warm_lease_max_heartbeat_failures}): "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        if heartbeat_failures >= config.warm_lease_max_heartbeat_failures:
+                            drain_reason = "lease heartbeat repeatedly failed"
+                    else:
+                        heartbeat_failures = 0
+                        if not maintained:
+                            drain_reason = "lease ownership was lost"
+                if drain_reason:
+                    if not pending_drain_reason:
+                        launcher_log(
+                            f"pool worker {pool_worker_id} requesting graceful drain of persistent {app.name} child: "
+                            f"{drain_reason}"
+                        )
+                    pending_drain_reason = drain_reason
+                    try:
+                        process.send_signal(signal.SIGUSR1)
+                    except ProcessLookupError:
+                        drain_requested = True
+                    except Exception as exc:
+                        drain_signal_failures += 1
+                        launcher_log(
+                            f"pool worker {pool_worker_id} could not signal persistent {app.name} child to drain: "
+                            f"{type(exc).__name__}: {exc}; will retry "
+                            f"({drain_signal_failures} failed attempt(s))"
+                        )
+                    else:
+                        # SIGUSR1 synchronously flips the compatible app worker's
+                        # drain event. It stops new claims immediately; this
+                        # parent then waits without a kill deadline so an active
+                        # turn can finish safely before the child exits.
+                        drain_requested = True
     except BaseException:
         if process is not None:
             _stop_persistent_child(process, worker_id=pool_worker_id, app_name=app.name)
@@ -1369,7 +2008,14 @@ def run_pool_worker(config: PoolConfig, *, worker_id: str, scratch_root: Path) -
         now = time.monotonic()
         warm_app = None
         if needs is not None and now >= next_warm_claim_at:
-            warm_app = claim_persistent_warm_app(config, needs, worker_id=worker_id)
+            try:
+                warm_app = claim_persistent_warm_app(config, needs, worker_id=worker_id)
+            except WarmLeaseError as exc:
+                launcher_log(
+                    f"pool worker {worker_id} could not coordinate a persistent warm child: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                warm_app = None
             if warm_app is None:
                 jitter = int(hashlib.sha256(worker_id.encode("utf-8")).hexdigest()[:4], 16) % 1000 / 1000.0
                 next_warm_claim_at = now + config.warm_lease_heartbeat_seconds * (1.0 + jitter)

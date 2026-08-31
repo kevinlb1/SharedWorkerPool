@@ -45,18 +45,43 @@ runs the app worker without `--once`, so its imports, runtime initialization,
 and app-owned caches remain ready between units of work. All other generic jobs
 continue through the normal fair one-shot dispatcher.
 
-The parent pool worker heartbeats its lease while the child runs. Leases older
-than `warm_lease_ttl_seconds` are recoverable after a dead Slurm job, and the
-lease limit is additionally capped by the control plane's current
+The parent pool worker heartbeats its lease while the child runs. Lease updates
+use an atomic directory lock rather than `flock`, because the shared home
+filesystem used by Slurm may not provide POSIX advisory locks. Lock acquisition
+is bounded by `warm_lease_lock_timeout_seconds`; an abandoned owner is
+recoverable after `warm_lease_lock_stale_seconds`, and release verifies both the
+owner token and directory inode so an old process cannot unlock a replacement.
+Malformed, unreadable, or wrong-version lease state fails closed instead of
+being silently replaced. Release and stale recovery also elect one inode-tied
+transition owner before renaming the lock directory. A crashed transition is
+not automatically superseded because portable NFS operations cannot safely
+fence the paused actor; that rare case remains failed closed for an operator to
+inspect after confirming no launcher or worker still owns it.
+
+Leases older than `warm_lease_ttl_seconds` are recoverable after a dead Slurm
+job, and the lease limit is additionally capped by the control plane's current
 `warmPool.requestedWorkers`. A fresh lease owned by an older worker version is
 kept until that child exits, preventing config rotation from starting a second
-warm child beside an active old one. New claims are refused while an app is
-draining or after `warmPool.secondsRemaining` expires. An already-running child
+warm child beside an active old one. Fresh leases continue to count as tail
+capacity even if a new config disables persistence or removes the app. New
+claims require finite, positive `warmPool.secondsRemaining` and are refused
+while an app is draining or after the request expires. An already-running child
 is never killed merely because the warm request expires; the app worker's own
 idle timeout lets active work finish and provides the post-turn warm window.
 If a login refresh arrives just as that idle timeout fires, the lease is
 released and a replacement may briefly start instead of extending the same
 process.
+
+If a child loses its lease, or lease heartbeats repeatedly fail, the parent
+sends `SIGUSR1` once and stops renewing. A compatible persistent app worker
+must interpret that signal as a graceful drain: stop claiming new work, let
+active work finish, and then exit. The shared parent waits and does not send
+`SIGTERM` or `SIGKILL` merely because lease coordination failed. The
+`warm_lease_max_heartbeat_failures` setting bounds how many consecutive failed
+heartbeat intervals occur before that drain request. A failed signal system
+call is retried; after the signal is delivered, stopping new claims is bounded
+by signal handling but process exit still waits for any active turn. Normal
+Slurm/parent teardown continues to use the regular termination path.
 
 The lease state and lock must be on storage shared by the submit host and Slurm
 jobs (normally the user's shared home filesystem). Recommended settings are a
