@@ -101,6 +101,39 @@ def _synthetic_ready_quarantine(
 
 
 class SharedWorkerPoolTests(unittest.TestCase):
+    def test_slurm_count_expands_pending_array_tasks(self) -> None:
+        def squeue(command, **kwargs):
+            rows = "123_0\n123_1\n123_2\n456\n" if "--array" in command else "123_[0-2]\n456\n"
+            return subprocess.CompletedProcess(command, 0, stdout=rows)
+
+        with patch.object(runtime_module, "find_command", return_value="/bin/squeue"), \
+                patch.object(runtime_module.subprocess, "run", side_effect=squeue) as run:
+            self.assertEqual(runtime_module.live_slurm_job_count("shared-worker", "example"), 4)
+        self.assertIn("example", run.call_args.args[0])
+
+    def test_startup_burst_does_not_repeat_while_workers_are_pending(self) -> None:
+        needs = [AppNeed(name="caida", queued_units=160, running_units=0, worker_capacity=8)]
+        live = 0
+        for _ in range(10):
+            live += desired_pool_submissions(
+                needs, live_slurm_jobs=live, min_idle_workers=0,
+                max_jobs=240, max_submit_per_cycle=96,
+                app_start_burst_workers=2, app_start_burst_overcommit=4,
+            )
+        self.assertEqual(live, 20)
+
+    def test_startup_burst_uses_only_missing_unregistered_capacity(self) -> None:
+        needs = [
+            AppNeed(name="busy", queued_units=0, running_units=16, worker_capacity=8),
+            AppNeed(name="new", queued_units=16, running_units=0, worker_capacity=8),
+        ]
+        for live, expected in [(2, 2), (3, 1), (4, 0)]:
+            self.assertEqual(desired_pool_submissions(
+                needs, live_slurm_jobs=live, min_idle_workers=0,
+                max_jobs=2, max_submit_per_cycle=4,
+                app_start_burst_workers=2, app_start_burst_overcommit=4,
+            ), expected)
+
     def test_host_load_threshold_uses_visible_host_cpus(self) -> None:
         self.assertEqual(host_load_cpu_basis(allocated_cpus=2, visible_cpus=32), 32)
         self.assertFalse(
@@ -412,6 +445,9 @@ class SharedWorkerPoolTests(unittest.TestCase):
                 pool_module._acquire_warm_lease_lock(config)
             pool_module._release_warm_lease_lock(ownership)
 
+            # Recovery performs filesystem I/O. Keep the contention timeout
+            # assertion above short without making recovery a 10ms speed test.
+            config = replace(config, warm_lease_lock_timeout_seconds=0.5)
             lock_path = pool_module.warm_lease_lock_path(config)
             lock_path.mkdir(mode=0o700)
             owner_path = lock_path / "owner.json"

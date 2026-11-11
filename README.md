@@ -132,6 +132,10 @@ python3 -m venv .venv
 
 ## Launcher
 
+Pending Slurm array tasks count individually toward the pool limit. Workers
+already waiting to start satisfy startup-burst demand, so an unavailable
+partition does not cause another burst on every launcher poll.
+
 ```bash
 python -m shared_worker_pool launcher --config config/shared_worker_pool.json
 ```

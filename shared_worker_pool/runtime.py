@@ -205,7 +205,9 @@ def live_slurm_job_count(job_name: str, user: str | None = None) -> int:
     squeue = find_command("squeue")
     if not squeue:
         raise RuntimeError("squeue not found; run the launcher on a Slurm submit host such as newcastle.cs.ubc.ca")
-    command = [squeue, "-h", "-n", job_name, "-t", "PD,R,CF,CG", "-o", "%i"]
+    # Pending arrays are otherwise compressed to one row (e.g. 123_[0-95]),
+    # which undercounts reserved workers and permits severe oversubmission.
+    command = [squeue, "--array", "-h", "-n", job_name, "-t", "PD,R,CF,CG", "-o", "%i"]
     if user:
         command[1:1] = ["-u", user]
     result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=20)

@@ -484,6 +484,11 @@ def desired_pool_submissions(
         for need in active_needs
         if need.queued_units > 0 and need.active_workers == 0
     )
+    # Jobs waiting in Slurm or still registering can serve the new app. Do not
+    # submit another startup burst every poll while those workers are pending.
+    registered_workers = sum(max(0, need.active_workers) for need in needs)
+    starting_workers = max(0, live_jobs - registered_workers)
+    startup_needed = max(0, startup_needed - starting_workers)
     if startup_needed <= 0:
         return normal_submit
     burst_room = max(0, int(max_jobs or 0) + burst_overcommit - live_jobs)
