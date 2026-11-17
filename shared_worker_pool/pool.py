@@ -27,6 +27,7 @@ from typing import Any
 
 from shared_worker_pool.runtime import (
     LauncherRequestError,
+    active_worker_summary,
     is_transient_control_error,
     json_request,
     launcher_log,
@@ -136,15 +137,19 @@ class AppNeed:
     restart_drain_active: bool = False
     warm_requested_workers: int = 0
     warm_request_expires_at: float = 0.0
+    registered_workers: int | None = None
+    available_slots: int = 0
 
     @property
     def needed_workers(self) -> int:
         if not self.enabled or self.restart_drain_active or self.queued_units <= 0:
             return 0
-        return math.ceil(self.queued_units / max(1, self.worker_capacity))
+        return math.ceil(max(0, self.queued_units - self.available_slots) / max(1, self.worker_capacity))
 
     @property
     def active_workers(self) -> int:
+        if self.registered_workers is not None:
+            return self.registered_workers
         return math.ceil(max(0, self.running_units) / max(1, self.worker_capacity))
 
     @property
@@ -426,11 +431,25 @@ def app_need_from_status(app: PoolAppProfile, status: dict[str, Any]) -> AppNeed
     if mode == "caida":
         jobs = status.get("jobs") if isinstance(status.get("jobs"), dict) else {}
         enabled = bool(status.get("clusterWorkersEnabled") or status.get("remoteWorkersEnabled"))
+        workers = status.get("workers")
+        shared_workers = []
+        for worker in workers if isinstance(workers, list) else []:
+            if not isinstance(worker, dict) or not str(worker.get("id", "")).startswith("shared-"):
+                continue
+            capacity = min(int(worker.get("capacity") or 0), int(status.get("claimLimit") or app.worker_capacity))
+            if str(worker.get("message") or "").startswith("resource backpressure:"):
+                capacity = min(capacity, int(worker.get("activeJobs") or 0))
+            shared_workers.append({**worker, "capacity": capacity})
+        observed = active_worker_summary({**status, "workers": shared_workers}, min_capacity=0)
+        registered = observed["activeWorkers"]
         return AppNeed(
             name=app.name,
             queued_units=max(0, int(jobs.get("queuedUnclaimed") or 0)),
             running_units=max(0, int(jobs.get("runningTotal") or 0)),
-            worker_capacity=app.worker_capacity,
+            worker_capacity=max(1, min(app.worker_capacity, observed["capacity"] // registered))
+            if registered else app.worker_capacity,
+            registered_workers=registered or None,
+            available_slots=observed["availableCapacity"],
             enabled=app.enabled and enabled,
             restart_drain_active=bool(status.get("restartDrainActive")),
             warm_requested_workers=warm_requested_workers,
@@ -506,6 +525,8 @@ def app_need_to_payload(need: AppNeed) -> dict[str, Any]:
         "restart_drain_active": need.restart_drain_active,
         "warm_requested_workers": need.warm_requested_workers,
         "warm_request_expires_at": need.warm_request_expires_at,
+        "registered_workers": need.registered_workers,
+        "available_slots": need.available_slots,
         "needed_workers": need.needed_workers,
         "active_workers": need.active_workers,
         "target_workers": need.target_workers,
@@ -528,6 +549,8 @@ def app_need_from_payload(payload: dict[str, Any]) -> AppNeed:
         restart_drain_active=bool(payload.get("restart_drain_active")),
         warm_requested_workers=max(0, int(payload.get("warm_requested_workers") or 0)),
         warm_request_expires_at=warm_request_expires_at,
+        registered_workers=payload.get("registered_workers"),
+        available_slots=max(0, int(payload.get("available_slots") or 0)),
     )
 
 

@@ -101,6 +101,22 @@ def _synthetic_ready_quarantine(
 
 
 class SharedWorkerPoolTests(unittest.TestCase):
+    def test_caida_scales_from_fresh_worker_admission_capacity(self) -> None:
+        app = PoolAppProfile("caida", "https://example.test", Path("token"), Path("."),
+                             "python", "app.worker", "caida", worker_capacity=8)
+        workers = [
+            {"id": f"shared-{i}-caida", "capacity": 2, "activeJobs": 2,
+             "lastSeenAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            for i in range(4)
+        ]
+        status = {"remoteWorkersEnabled": True, "workers": workers,
+                  "jobs": {"queuedUnclaimed": 8, "runningTotal": 8}}
+        need = app_need_from_status(app, status)
+        self.assertEqual(need.target_workers, 8)
+        self.assertEqual(pool_module.app_need_from_payload(pool_module.app_need_to_payload(need)), need)
+        workers[0]["activeJobs"] = 0
+        self.assertEqual(app_need_from_status(app, status).target_workers, 7)
+
     def test_slurm_count_expands_pending_array_tasks(self) -> None:
         def squeue(command, **kwargs):
             rows = "123_0\n123_1\n123_2\n456\n" if "--array" in command else "123_[0-2]\n456\n"
