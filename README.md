@@ -58,6 +58,11 @@ not automatically superseded because portable NFS operations cannot safely
 fence the paused actor; that rare case remains failed closed for an operator to
 inspect after confirming no launcher or worker still owns it.
 
+During release and stale recovery, the coordinator defers `SIGTERM` until the
+transition finishes, then restores its previous signal mask. This lets the
+launcher's scheduled shutdown complete after it detaches the lock directory.
+Host failure or a forced kill during a transition still requires operator review.
+
 The verified rename of that exact lock inode to a unique detached quarantine is
 the unlock commit point. The first detached name ends in `.pending` and is
 never eligible for automatic cleanup. Only after the releaser verifies the

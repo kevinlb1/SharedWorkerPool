@@ -21,9 +21,10 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from shared_worker_pool.runtime import (
     LauncherRequestError,
@@ -36,8 +37,8 @@ from shared_worker_pool.runtime import (
 )
 
 
-POOL_LAUNCHER_VERSION = "shared-worker-pool-20260830-nfs-warm-cleanup"
-POOL_WORKER_VERSION = "shared-worker-pool-worker-20260830-nfs-warm-cleanup"
+POOL_LAUNCHER_VERSION = "shared-worker-pool-20261119-warm-lock-sigterm"
+POOL_WORKER_VERSION = "shared-worker-pool-worker-20261119-warm-lock-sigterm"
 WARM_LEASE_STATE_VERSION = 1
 WARM_LOCK_OWNER_VERSION = 1
 MAX_WARM_LEASE_STATE_BYTES = 1024 * 1024
@@ -1332,6 +1333,18 @@ def _finish_warm_lock_quarantine_cleanup(
         )
 
 
+@contextmanager
+def _defer_warm_lock_sigterm() -> Iterator[None]:
+    # The single-threaded coordinator must detach the elected inode before a
+    # launcher timeout or worker shutdown can terminate the transition owner.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@_defer_warm_lock_sigterm()
 def _recover_stale_warm_lock(config: PoolConfig, lock_path: Path, *, now: float) -> bool:
     directory_fd: int | None = None
     try:
@@ -1555,6 +1568,7 @@ def _acquire_warm_lease_lock(config: PoolConfig) -> _WarmLeaseLockOwnership:
         )
 
 
+@_defer_warm_lock_sigterm()
 def _release_warm_lease_lock(ownership: _WarmLeaseLockOwnership) -> None:
     quarantine_token = uuid.uuid4().hex
     pending_quarantine: Path | None = None

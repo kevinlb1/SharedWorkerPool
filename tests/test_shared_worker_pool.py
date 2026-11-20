@@ -851,6 +851,36 @@ class SharedWorkerPoolTests(unittest.TestCase):
             pool_module._release_warm_lease_lock(old)
             pool_module._release_warm_lease_lock(replacement)
 
+    def test_sigterm_during_transition_is_delivered_after_lock_detaches(self) -> None:
+        for action in ("release", "recover"):
+            with self.subTest(action=action), TemporaryDirectory() as tmp:
+                config = _config(Path(tmp), ())
+                lock_path = pool_module.warm_lease_lock_path(config)
+                canonical_at_delivery = []
+                original_handler = signal.signal(
+                    signal.SIGTERM, lambda *_: canonical_at_delivery.append(lock_path.exists())
+                )
+                rename = pool_module.os.rename
+
+                def interrupt_detach(source, destination):
+                    if source == lock_path:
+                        self.assertTrue(list(lock_path.glob("transition.*.json")))
+                        signal.raise_signal(signal.SIGTERM)
+                    rename(source, destination)
+
+                try:
+                    with patch.object(pool_module.os, "rename", side_effect=interrupt_detach):
+                        if action == "release":
+                            owner = pool_module._acquire_warm_lease_lock(config)
+                            pool_module._release_warm_lease_lock(owner)
+                        else:
+                            lock_path.mkdir()
+                            now = time.time() + config.warm_lease_lock_stale_seconds + 1
+                            self.assertTrue(pool_module._recover_stale_warm_lock(config, lock_path, now=now))
+                finally:
+                    signal.signal(signal.SIGTERM, original_handler)
+                self.assertEqual(canonical_at_delivery, [False])
+
     def test_pre_detach_release_failure_remains_strict_and_does_not_mask_callback(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
